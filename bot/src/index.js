@@ -66,9 +66,9 @@ if(bootstrapTrusted.size){
 
 const publicUrl=String(process.env.PUBLIC_URL||'').replace(/\/$/,'');
 
-const oauthRedirect=
+const oauthRedirect =
   process.env.DISCORD_OAUTH_REDIRECT ||
-  (publicUrl?`${publicUrl}/oauth/callback`:'');
+  (publicUrl ? `${publicUrl}/oauth/callback` : '');
 
 const oauthConfigured=Boolean(
   process.env.DISCORD_CLIENT_SECRET &&
