@@ -39,7 +39,6 @@ let cfg = load();
 
 const sessions = new Map();
 const dashboardSessions = new Map();
-const oauthStates = new Map();
 
 const timeoutMs = 3 * 60 * 60 * 1000;
 
@@ -71,12 +70,131 @@ const publicUrl = String(
 
 const oauthRedirect =
   process.env.DISCORD_OAUTH_REDIRECT ||
-  'https://project-skye-applications.onrender.com/oauth/callback';
+  (publicUrl
+    ? `${publicUrl}/oauth/callback`
+    : 'https://project-skye-applications.onrender.com/oauth/callback');
 
 const oauthConfigured = Boolean(
   process.env.DISCORD_CLIENT_SECRET &&
   process.env.CLIENT_ID
 );
+
+/*
+ * OAuth state
+ *
+ * The state is signed instead of being stored in a Map.
+ * This means a Render restart will NOT invalidate the OAuth state.
+ */
+
+function oauthStateSecret() {
+  return String(
+    process.env.DISCORD_CLIENT_SECRET ||
+    process.env.DISCORD_TOKEN ||
+    'skye-oauth-fallback-secret'
+  );
+}
+
+function createOAuthState() {
+  const payload = JSON.stringify({
+    nonce: crypto.randomBytes(24).toString('hex'),
+    createdAt: Date.now()
+  });
+
+  const encoded = Buffer
+    .from(payload)
+    .toString('base64url');
+
+  const signature = crypto
+    .createHmac(
+      'sha256',
+      oauthStateSecret()
+    )
+    .update(encoded)
+    .digest('base64url');
+
+  return `${encoded}.${signature}`;
+}
+
+function verifyOAuthState(state) {
+  if (
+    !state ||
+    typeof state !== 'string'
+  ) {
+    return false;
+  }
+
+  const parts = state.split('.');
+
+  if (parts.length !== 2) {
+    return false;
+  }
+
+  const [encoded, signature] = parts;
+
+  if (!encoded || !signature) {
+    return false;
+  }
+
+  const expected = crypto
+    .createHmac(
+      'sha256',
+      oauthStateSecret()
+    )
+    .update(encoded)
+    .digest('base64url');
+
+  const signatureBuffer =
+    Buffer.from(signature);
+
+  const expectedBuffer =
+    Buffer.from(expected);
+
+  if (
+    signatureBuffer.length !==
+    expectedBuffer.length
+  ) {
+    return false;
+  }
+
+  if (
+    !crypto.timingSafeEqual(
+      signatureBuffer,
+      expectedBuffer
+    )
+  ) {
+    return false;
+  }
+
+  try {
+    const payload = JSON.parse(
+      Buffer.from(
+        encoded,
+        'base64url'
+      ).toString('utf8')
+    );
+
+    if (
+      !payload ||
+      typeof payload.createdAt !== 'number'
+    ) {
+      return false;
+    }
+
+    const age =
+      Date.now() - payload.createdAt;
+
+    if (
+      age < 0 ||
+      age > 10 * 60 * 1000
+    ) {
+      return false;
+    }
+
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function cookieMap(req) {
   const out = {};
@@ -178,21 +296,27 @@ function oauthLogin(req, res) {
   }
 
   const state =
-    crypto.randomBytes(24).toString('hex');
-
-  oauthStates.set(state, {
-    expires:
-      Date.now() + 10 * 60 * 1000,
-    redirect: oauthRedirect
-  });
+    createOAuthState();
 
   const params =
     new URLSearchParams({
-      client_id: process.env.CLIENT_ID,
-      response_type: 'code',
-      redirect_uri: oauthRedirect,
-      scope: 'identify'
+      client_id:
+        process.env.CLIENT_ID,
+
+      response_type:
+        'code',
+
+      redirect_uri:
+        oauthRedirect,
+
+      scope:
+        'identify'
     });
+
+  console.log(
+    'Starting Discord OAuth login with redirect:',
+    oauthRedirect
+  );
 
   res.writeHead(302, {
     Location:
@@ -218,20 +342,20 @@ async function oauthCallback(
   const state =
     url.searchParams.get('state') || '';
 
-  const oauthState =
-    oauthStates.get(state);
+  console.log(
+    'Discord OAuth callback received.'
+  );
 
   if (
-    !state ||
-    !oauthState ||
-    oauthState.expires < Date.now()
+    !verifyOAuthState(state)
   ) {
-    if (state) {
-      oauthStates.delete(state);
-    }
+    console.error(
+      'OAuth state verification failed.'
+    );
 
     res.writeHead(400, {
-      'Content-Type': 'text/plain'
+      'Content-Type':
+        'text/plain'
     });
 
     return res.end(
@@ -239,14 +363,13 @@ async function oauthCallback(
     );
   }
 
-  oauthStates.delete(state);
-
   const code =
     url.searchParams.get('code');
 
   if (!code) {
     res.writeHead(400, {
-      'Content-Type': 'text/plain'
+      'Content-Type':
+        'text/plain'
     });
 
     return res.end(
@@ -277,7 +400,7 @@ async function oauthCallback(
         code,
 
         redirect_uri:
-          oauthState.redirect
+          oauthRedirect
       })
     }
   );
@@ -285,11 +408,14 @@ async function oauthCallback(
   if (!tokenRes.ok) {
     console.error(
       'Discord token exchange failed:',
-      await tokenRes.text().catch(() => '')
+      await tokenRes.text().catch(
+        () => ''
+      )
     );
 
     res.writeHead(502, {
-      'Content-Type': 'text/plain'
+      'Content-Type':
+        'text/plain'
     });
 
     return res.end(
@@ -312,8 +438,16 @@ async function oauthCallback(
   );
 
   if (!meRes.ok) {
+    console.error(
+      'Could not read Discord account:',
+      await meRes.text().catch(
+        () => ''
+      )
+    );
+
     res.writeHead(502, {
-      'Content-Type': 'text/plain'
+      'Content-Type':
+        'text/plain'
     });
 
     return res.end(
@@ -324,31 +458,50 @@ async function oauthCallback(
   const me =
     await meRes.json();
 
+  console.log(
+    'Discord OAuth successful for user:',
+    me.username,
+    me.id
+  );
+
   const session =
     crypto.randomBytes(32).toString('hex');
 
   dashboardSessions.set(
     session,
     {
-      id: me.id,
-      username: me.username,
+      id:
+        me.id,
+
+      username:
+        me.username,
+
       global_name:
         me.global_name ||
         me.username,
+
       avatar:
         me.avatar || null,
-      createdAt: Date.now()
+
+      createdAt:
+        Date.now()
     }
   );
 
   res.writeHead(302, {
     Location: '/',
-    'Set-Cookie': cookie(
-      'skye_session',
-      session,
-      604800,
-      true
-    )
+
+    'Set-Cookie': [
+      cookie(
+        'skye_session',
+        session,
+        604800,
+        true
+      ),
+      clearCookie(
+        'skye_oauth_state'
+      )
+    ]
   });
 
   res.end();
@@ -554,12 +707,18 @@ async function handleDashboard(
     url.pathname === '/api/health'
   ) {
     return json(res, 200, {
-      online: client.isReady(),
+      online:
+        client.isReady(),
+
       tag:
         client.user?.tag ||
         null,
-      dashboard: true,
-      port: dashboardPort
+
+      dashboard:
+        true,
+
+      port:
+        dashboardPort
     });
   }
 
@@ -578,7 +737,8 @@ async function handleDashboard(
   ) {
     return json(res, 200, {
       user,
-      trusted: true
+      trusted:
+        true
     });
   }
 
@@ -818,7 +978,8 @@ async function handleDashboard(
     res,
     404,
     {
-      error: 'Not found'
+      error:
+        'Not found'
     }
   );
 }
@@ -886,7 +1047,9 @@ function appType(id) {
 
 function panelEmbed() {
   return new EmbedBuilder()
-    .setColor(accent())
+    .setColor(
+      accent()
+    )
     .setTitle(
       cfg.panel?.title ||
       'Skye Applications'
@@ -922,6 +1085,7 @@ function panelComponents() {
       row.components.length >= 5
     ) {
       rows.push(row);
+
       row =
         new ActionRowBuilder();
     }
@@ -934,11 +1098,16 @@ function panelComponents() {
         )
         .setLabel(
           String(
-            app.name || 'Apply'
-          ).slice(0, 80)
+            app.name ||
+            'Apply'
+          ).slice(
+            0,
+            80
+          )
         )
         .setEmoji(
-          app.emoji || '📋'
+          app.emoji ||
+          '📋'
         )
         .setStyle(
           ButtonStyle.Secondary
@@ -989,7 +1158,9 @@ function sourceRow() {
 
 function confirmationEmbed(app) {
   return new EmbedBuilder()
-    .setColor(accent())
+    .setColor(
+      accent()
+    )
     .setTitle(
       'Application Started'
     )
@@ -1021,7 +1192,9 @@ function questionEmbed(
     app.questions || [];
 
   return new EmbedBuilder()
-    .setColor(accent())
+    .setColor(
+      accent()
+    )
     .setTitle(
       (
         app.emoji ||
@@ -1066,7 +1239,9 @@ async function startApplication(
   const dm =
     await interaction.user
       .createDM()
-      .catch(() => null);
+      .catch(
+        () => null
+      );
 
   if (!dm) {
     return interaction.reply({
@@ -1092,7 +1267,8 @@ async function startApplication(
 
     startedAt: null,
 
-    state: 'confirm',
+    state:
+      'confirm',
 
     dmChannelId:
       dm.id
@@ -1167,13 +1343,18 @@ async function beginApplication(
   session.startedAt =
     Date.now();
 
-  session.index = 0;
-  session.answers = [];
+  session.index =
+    0;
+
+  session.answers =
+    [];
 
   await interaction.update({
     embeds: [
       new EmbedBuilder()
-        .setColor(accent())
+        .setColor(
+          accent()
+        )
         .setTitle(
           'Application Started'
         )
@@ -1275,7 +1456,9 @@ async function finishApplication(
           .fetch(
             session.userId
           )
-          .catch(() => null)
+          .catch(
+            () => null
+          )
       )?.tag ||
       session.userId,
 
@@ -1352,7 +1535,9 @@ async function finishApplication(
       .fetch(
         reviewChannelId
       )
-      .catch(() => null);
+      .catch(
+        () => null
+      );
 
   if (
     !reviewChannel ||
@@ -1363,31 +1548,47 @@ async function finishApplication(
 
   const embed =
     new EmbedBuilder()
-      .setColor(accent())
+      .setColor(
+        accent()
+      )
       .setTitle(
         '📋 New Application'
       )
       .addFields(
         {
-          name: 'Application',
+          name:
+            'Application',
+
           value:
             app?.name ||
             'Application',
-          inline: true
+
+          inline:
+            true
         },
+
         {
-          name: 'Applicant',
+          name:
+            'Applicant',
+
           value:
             '<@' +
             session.userId +
             '>',
-          inline: true
+
+          inline:
+            true
         },
+
         {
-          name: 'Status',
+          name:
+            'Status',
+
           value:
             '🟡 Pending',
-          inline: true
+
+          inline:
+            true
         }
       )
       .setFooter({
@@ -1411,13 +1612,18 @@ async function finishApplication(
         String(
           session.answers[index] ||
           'No answer'
-        ).slice(0, 1024)
+        ).slice(
+          0,
+          1024
+        )
     });
   }
 
   const message =
     await reviewChannel.send({
-      embeds: [embed],
+      embeds: [
+        embed
+      ],
 
       components: [
         reviewRows(id)
@@ -1447,12 +1653,16 @@ function reviewRows(
           'skye_accept:' +
           id
         )
-        .setLabel('Accept')
+        .setLabel(
+          'Accept'
+        )
         .setEmoji('✅')
         .setStyle(
           ButtonStyle.Success
         )
-        .setDisabled(disabled),
+        .setDisabled(
+          disabled
+        ),
 
       new ButtonBuilder()
         .setCustomId(
@@ -1465,19 +1675,25 @@ function reviewRows(
         .setStyle(
           ButtonStyle.Success
         )
-        .setDisabled(disabled),
+        .setDisabled(
+          disabled
+        ),
 
       new ButtonBuilder()
         .setCustomId(
           'skye_deny:' +
           id
         )
-        .setLabel('Deny')
+        .setLabel(
+          'Deny'
+        )
         .setEmoji('⛔')
         .setStyle(
           ButtonStyle.Danger
         )
-        .setDisabled(disabled),
+        .setDisabled(
+          disabled
+        ),
 
       new ButtonBuilder()
         .setCustomId(
@@ -1490,18 +1706,24 @@ function reviewRows(
         .setStyle(
           ButtonStyle.Danger
         )
-        .setDisabled(disabled),
+        .setDisabled(
+          disabled
+        ),
 
       new ButtonBuilder()
         .setCustomId(
           'skye_details:' +
           id
         )
-        .setLabel('Details')
+        .setLabel(
+          'Details'
+        )
         .setStyle(
           ButtonStyle.Secondary
         )
-        .setDisabled(disabled)
+        .setDisabled(
+          disabled
+        )
     );
 }
 
@@ -1535,7 +1757,9 @@ function reasonModal(
         TextInputStyle.Paragraph
       )
       .setRequired(true)
-      .setMaxLength(1000);
+      .setMaxLength(
+        1000
+      );
 
   return new ModalBuilder()
     .setCustomId(
@@ -1555,7 +1779,9 @@ function reasonModal(
     )
     .addComponents(
       new ActionRowBuilder()
-        .addComponents(input)
+        .addComponents(
+          input
+        )
     );
 }
 
@@ -1606,10 +1832,13 @@ async function handleReview(
     id,
     {
       status,
+
       reviewReason:
         reason || '',
+
       reviewedBy:
         interaction.user.id,
+
       reviewedAt:
         new Date().toISOString()
     }
@@ -1625,21 +1854,32 @@ async function handleReview(
       interaction.message
         .embeds[0]
     )
-      .setColor(color)
+      .setColor(
+        color
+      )
       .addFields({
-        name: 'Status',
+        name:
+          'Status',
+
         value:
           status === 'Accepted'
             ? '🟢 Accepted'
             : '🔴 Denied',
-        inline: true
+
+        inline:
+          true
       });
 
   if (reason) {
     embed.addFields({
-      name: 'Reason',
+      name:
+        'Reason',
+
       value:
-        reason.slice(0, 1024)
+        reason.slice(
+          0,
+          1024
+        )
     });
   }
 
@@ -1650,7 +1890,10 @@ async function handleReview(
   });
 
   await interaction.message.edit({
-    embeds: [embed],
+    embeds: [
+      embed
+    ],
+
     components: [
       reviewRows(
         id,
@@ -1664,13 +1907,17 @@ async function handleReview(
       .fetch(
         submission.userId
       )
-      .catch(() => null);
+      .catch(
+        () => null
+      );
 
   if (user) {
     await user.send({
       embeds: [
         new EmbedBuilder()
-          .setColor(color)
+          .setColor(
+            color
+          )
           .setTitle(
             status === 'Accepted'
               ? 'Application Accepted'
@@ -1689,7 +1936,9 @@ async function handleReview(
               'Sent By Skye Support'
           })
       ]
-    }).catch(() => {});
+    }).catch(
+      () => {}
+    );
   }
 
   return interaction.reply({
@@ -1700,7 +1949,8 @@ async function handleReview(
           : '⛔ Application denied.'
       ),
 
-    ephemeral: true
+    ephemeral:
+      true
   });
 }
 
@@ -1823,6 +2073,7 @@ client.on(
                   'Your application has been cancelled.'
                 )
             ],
+
             components: []
           });
         }
@@ -2016,7 +2267,8 @@ client.on(
                 3900
               ),
 
-            ephemeral: true
+            ephemeral:
+              true
           });
         }
       }
@@ -2120,7 +2372,8 @@ client.on(
             ).length;
 
           return interaction.reply({
-            ephemeral: true,
+            ephemeral:
+              true,
 
             embeds: [
               new EmbedBuilder()
@@ -2134,38 +2387,53 @@ client.on(
                   {
                     name:
                       'Total',
+
                     value:
                       String(
                         submissions.length
                       ),
-                    inline: true
+
+                    inline:
+                      true
                   },
+
                   {
                     name:
                       'Pending',
+
                     value:
                       String(
                         pending
                       ),
-                    inline: true
+
+                    inline:
+                      true
                   },
+
                   {
                     name:
                       'Accepted',
+
                     value:
                       String(
                         accepted
                       ),
-                    inline: true
+
+                    inline:
+                      true
                   },
+
                   {
                     name:
                       'Denied',
+
                     value:
                       String(
                         denied
                       ),
-                    inline: true
+
+                    inline:
+                      true
                   }
                 )
             ]
@@ -2177,7 +2445,8 @@ client.on(
           'skye-help'
         ) {
           return interaction.reply({
-            ephemeral: true,
+            ephemeral:
+              true,
 
             content:
               '**Skye Applications**\n\n' +
@@ -2201,7 +2470,9 @@ client.on(
           content:
             'Skye encountered an error while processing that action.',
           ephemeral: true
-        }).catch(() => {});
+        }).catch(
+          () => {}
+        );
       }
     }
   }
@@ -2221,20 +2492,6 @@ setInterval(
       ) {
         sessions.delete(
           session.userId
-        );
-      }
-    }
-
-    for (
-      const [state, data]
-      of oauthStates
-    ) {
-      if (
-        data.expires <
-        Date.now()
-      ) {
-        oauthStates.delete(
-          state
         );
       }
     }
