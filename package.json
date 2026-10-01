@@ -1,0 +1,15 @@
+{
+  "name": "skye-applications",
+  "private": true,
+  "workspaces": [
+    "dashboard",
+    "bot"
+  ],
+  "scripts": {
+    "start": "npm --workspace bot run start",
+    "dev": "npm --workspace bot run dev",
+    "start:bot": "npm --workspace bot run start",
+    "dev:bot": "npm --workspace bot run dev",
+    "deploy": "npm --workspace bot run deploy"
+  }
+}

@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: skye-applications
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: DASHBOARD_PORT
+        value: 10000
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: GUILD_ID
+        sync: false
+      - key: DISCORD_CLIENT_SECRET
+        sync: false
+      - key: PUBLIC_URL
+        sync: false
+      - key: DISCORD_OAUTH_REDIRECT
+        sync: false
+      - key: TRUSTED_USER_IDS
+        sync: false
