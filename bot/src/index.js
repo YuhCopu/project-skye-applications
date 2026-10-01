@@ -178,14 +178,14 @@ function authRequired(req, res) {
       <html>
       <head>
         <meta charset="utf-8">
-        <title>Skye Dashboard</title>
+        <title>Relive Dashboard</title>
         <meta name="viewport" content="width=device-width, initial-scale=1">
       </head>
       <body style="font-family:system-ui;background:#090b0f;color:#e8ecf5;display:grid;place-items:center;height:100vh;margin:0">
         <main style="max-width:520px;padding:30px;border:1px solid #272d39;border-radius:14px;background:#0e1218">
-          <h2>Skye Dashboard</h2>
+          <h2>Relive Dashboard</h2>
           <p>Your Discord account is authenticated, but it is not registered as a trusted dashboard user.</p>
-          <p>Ask the Skye owner to add your Discord user ID to the trusted users list.</p>
+          <p>Ask the Relive owner to add your Discord user ID to the trusted users list.</p>
           <a href="/logout" style="color:#aebfff">Sign out</a>
         </main>
       </body>
@@ -459,13 +459,13 @@ function authPage() {
     <html>
     <head>
       <meta charset="utf-8">
-      <title>Skye Dashboard Login</title>
+      <title>Relive Dashboard Login</title>
       <meta name="viewport" content="width=device-width,initial-scale=1">
     </head>
     <body style="font-family:system-ui;background:#090b0f;color:#e8ecf5;display:grid;place-items:center;height:100vh;margin:0">
       <main style="width:min(420px,calc(100% - 32px));padding:30px;border:1px solid #272d39;border-radius:16px;background:#0e1218;text-align:center">
         <div style="font-size:38px">☁️</div>
-        <h1>Skye Applications</h1>
+        <h1>Relive Applications</h1>
         <p style="color:#7f899b">Private dashboard. Discord authentication is required.</p>
 
         <a
@@ -963,13 +963,13 @@ dashboardServer.on('error', (err) => {
       '0.0.0.0',
       () => {
         console.log(
-          `Skye dashboard port 8787 was busy. Dashboard: http://127.0.0.1:${dashboardPort}`
+          `Relive dashboard port 8787 was busy. Dashboard: http://127.0.0.1:${dashboardPort}`
         );
       }
     );
   } else {
     console.error(
-      'Skye dashboard server error:',
+      'Relive dashboard server error:',
       err
     );
   }
@@ -980,7 +980,7 @@ dashboardServer.listen(
   '0.0.0.0',
   () => {
     console.log(
-      `Skye dashboard: http://127.0.0.1:${dashboardPort}`
+      `Relive dashboard: http://127.0.0.1:${dashboardPort}`
     );
   }
 );
@@ -1061,7 +1061,7 @@ function panelComponents() {
     row.addComponents(
       new ButtonBuilder()
         .setCustomId(
-          `skye_apply:${a.id}`
+          `relive_apply:${a.id}`
         )
         .setLabel(
           a.name.slice(0, 80)
@@ -1089,7 +1089,7 @@ function reviewRows(
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(
-        `skye_accept:${id}`
+        `relive_accept:${id}`
       )
       .setLabel('Accept')
       .setEmoji('✅')
@@ -1098,7 +1098,7 @@ function reviewRows(
 
     new ButtonBuilder()
       .setCustomId(
-        `skye_accept_reason:${id}`
+        `relive_accept_reason:${id}`
       )
       .setLabel('Accept with Reason')
       .setEmoji('📝')
@@ -1107,7 +1107,7 @@ function reviewRows(
 
     new ButtonBuilder()
       .setCustomId(
-        `skye_deny:${id}`
+        `relive_deny:${id}`
       )
       .setLabel('Deny')
       .setEmoji('⛔')
@@ -1116,7 +1116,7 @@ function reviewRows(
 
     new ButtonBuilder()
       .setCustomId(
-        `skye_deny_reason:${id}`
+        `relive_deny_reason:${id}`
       )
       .setLabel('Deny with Reason')
       .setEmoji('📝')
@@ -1125,7 +1125,7 @@ function reviewRows(
 
     new ButtonBuilder()
       .setCustomId(
-        `skye_details:${id}`
+        `Relive_details:${id}`
       )
       .setLabel('Details')
       .setEmoji('🔎')
@@ -1181,7 +1181,7 @@ async function applyRoles(
 
 function dmFooter() {
   return {
-    text: 'Sent By Skye Support',
+    text: 'Sent By Relive Support',
   };
 }
 
@@ -1189,7 +1189,7 @@ function cancelRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(
-        'skye_cancel_application'
+        'Relive_cancel_application'
       )
       .setLabel(
         'Cancel Application'
@@ -1203,10 +1203,10 @@ function sourceRow() {
   return new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(
-        'skye_dm_source'
+        'Relive_dm_source'
       )
       .setLabel(
-        'Sent By Skye Support'
+        'Sent By Relive Support'
       )
       .setStyle(
         ButtonStyle.Secondary
@@ -1220,7 +1220,7 @@ function confirmationRows(appId) {
     new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(
-          `skye_dm_start:${appId}`
+          `relive_dm_start:${appId}`
         )
         .setLabel(
           'Start Application'
@@ -1232,7 +1232,7 @@ function confirmationRows(appId) {
 
       new ButtonBuilder()
         .setCustomId(
-          'skye_cancel_application'
+          'relive_cancel_application'
         )
         .setLabel(
           'Cancel Application'
@@ -1437,7 +1437,7 @@ async function cancelApplication(
   if (!s) {
     return interaction.reply({
       content:
-        'There is no active Skye application to cancel.',
+        'There is no active Relive application to cancel.',
       ephemeral: true,
     });
   }
@@ -1455,7 +1455,7 @@ async function cancelApplication(
           'Application Cancelled'
         )
         .setDescription(
-          'Your Skye application has been cancelled. You can start a new application from the server panel.'
+          'Your Relive application has been cancelled. You can start a new application from the server panel.'
         );
 
     await interaction.message
@@ -1496,7 +1496,7 @@ async function timedOut(s) {
           'Application Timed Out'
         )
         .setDescription(
-          'Your Skye application was not completed within **3 hours**. You can start again from the application panel.'
+          'Your Relive application was not completed within **3 hours**. You can start again from the application panel.'
         )
         .setFooter(dmFooter()),
     ],
@@ -1759,7 +1759,7 @@ function reasonModal(
 
   return new ModalBuilder()
     .setCustomId(
-      `skye_reason_submit:${
+      `relive_reason_submit:${
         accepted
           ? 'accept'
           : 'deny'
@@ -1792,7 +1792,7 @@ async function review(
   if (!permission(i)) {
     return i.reply({
       content:
-        'You do not have permission to review Skye applications.',
+        'You do not have permission to review Relive applications.',
       ephemeral: true,
     });
   }
@@ -1996,7 +1996,7 @@ client.once(
   'ready',
   () => {
     console.log(
-      `Skye Applications online as ${client.user.tag}`
+      `Relive Applications online as ${client.user.tag}`
     );
   }
 );
@@ -2060,7 +2060,7 @@ client.on(
                 'Application Cancelled'
               )
               .setDescription(
-                'Your Skye application has been cancelled. You can start a new application from the server panel.'
+                'Your Relive application has been cancelled. You can start a new application from the server panel.'
               )
               .setFooter(
                 dmFooter()
@@ -2107,16 +2107,16 @@ client.on(
         ) {
           return i.reply({
             content:
-              'You need Manage Server to use Skye admin commands.',
+              'You need Manage Server to use Relive admin commands.',
             ephemeral: true,
           });
         }
 
-        /* /skye-panel */
+        /* /relive-panel */
 
         if (
           i.commandName ===
-          'skye-panel'
+          'relive-panel'
         ) {
           await i.channel.send({
             embeds: [
@@ -2128,7 +2128,7 @@ client.on(
 
           return i.reply({
             content:
-              '☁️ Skye application panel posted.',
+              '☁️ Relive application panel posted.',
             ephemeral: true,
           });
         }
@@ -2137,7 +2137,7 @@ client.on(
 
         if (
           i.commandName ===
-          'skye-config'
+          'relive-config'
         ) {
           const o =
             i.options;
@@ -2176,7 +2176,7 @@ client.on(
           return i.reply({
             ephemeral: true,
             content:
-              `**Skye configuration saved.**\n` +
+              `**Relive configuration saved.**\n` +
               `🛠️ ${
                 cfg.channels.support
                   ? `<#${cfg.channels.support}>`
@@ -2209,7 +2209,7 @@ client.on(
 
         if (
           i.commandName ===
-          'skye-stats'
+          'relive-stats'
         ) {
           const all =
             allSubmissions();
@@ -2250,7 +2250,7 @@ client.on(
                   accent()
                 )
                 .setTitle(
-                  '☁️ Skye Application Statistics'
+                  '☁️ Relive Application Statistics'
                 )
                 .addFields(
                   {
@@ -2299,7 +2299,7 @@ client.on(
           });
         }
 
-        /* /skye-search */
+        /* /relive-search */
 
         if (
           i.commandName ===
@@ -2353,11 +2353,11 @@ client.on(
           });
         }
 
-        /* /skye-trust */
+        /* /relive-trust */
 
         if (
           i.commandName ===
-          'skye-trust'
+          'relive-trust'
         ) {
           const u =
             i.options.getUser(
@@ -2377,15 +2377,15 @@ client.on(
           return i.reply({
             ephemeral: true,
             content:
-              `🔐 <@${u.id}> is now a trusted Skye dashboard user.`,
+              `🔐 <@${u.id}> is now a trusted Relive dashboard user.`,
           });
         }
 
-        /* /skye-untrust */
+        /* /relive-untrust */
 
         if (
           i.commandName ===
-          'skye-untrust'
+          'relive-untrust'
         ) {
           const u =
             i.options.getUser(
@@ -2424,7 +2424,7 @@ client.on(
 
         if (
           i.commandName ===
-          'skye-applicant'
+          'relive-applicant'
         ) {
           const u =
             i.options.getUser(
@@ -2454,21 +2454,21 @@ client.on(
           });
         }
 
-        /* /skye-help */
+        /* /relive-help */
 
         if (
           i.commandName ===
-          'skye-help'
+          'relive-help'
         ) {
           return i.reply({
             ephemeral: true,
             content:
-              '**Skye Applications**\n' +
-              '`/skye-panel` post panel\n' +
-              '`/skye-config` configure channels/review role\n' +
-              '`/skye-stats` view totals\n' +
-              '`/skye-search` search applications\n' +
-              '`/skye-applicant` view a user’s applications',
+              '**relive Applications**\n' +
+              '`/relive-panel` post panel\n' +
+              '`/relive-config` configure channels/review role\n' +
+              '`/relive-stats` view totals\n' +
+              '`/relive-search` search applications\n' +
+              '`/relive-applicant` view a user’s applications',
           });
         }
       }
@@ -2480,7 +2480,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId ===
-          'skye_cancel_application'
+          'relive_cancel_application'
       ) {
         return cancelApplication(
           i.user.id,
@@ -2495,7 +2495,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId.startsWith(
-          'skye_dm_start:'
+          'relive_dm_start:'
         )
       ) {
         const s =
@@ -2539,7 +2539,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId ===
-          'skye_dm_source'
+          'relive_dm_source'
       ) {
         return i.deferUpdate();
       }
@@ -2551,7 +2551,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId.startsWith(
-          'skye_apply:'
+          'relive_apply:'
         )
       ) {
         const app =
@@ -2576,7 +2576,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId.startsWith(
-          'skye_accept_reason:'
+          'relive_accept_reason:'
         )
       ) {
         if (!permission(i)) {
@@ -2604,7 +2604,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId.startsWith(
-          'skye_deny_reason:'
+          'relive_deny_reason:'
         )
       ) {
         if (!permission(i)) {
@@ -2632,7 +2632,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId.startsWith(
-          'skye_accept:'
+          'relive_accept:'
         )
       ) {
         return review(
@@ -2651,7 +2651,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId.startsWith(
-          'skye_deny:'
+          'relive_deny:'
         )
       ) {
         return review(
@@ -2670,7 +2670,7 @@ client.on(
       if (
         i.isButton() &&
         i.customId.startsWith(
-          'skye_details:'
+          'relive_details:'
         )
       ) {
         const id =
@@ -2752,7 +2752,7 @@ client.on(
       if (
         i.isModalSubmit() &&
         i.customId.startsWith(
-          'skye_reason_submit:'
+          'relive_reason_submit:'
         )
       ) {
         const [
@@ -2780,7 +2780,7 @@ client.on(
       }
     } catch (e) {
       console.error(
-        'Skye interaction error:',
+        'Relive interaction error:',
         e
       );
 
@@ -2791,7 +2791,7 @@ client.on(
         await i
           .reply({
             content:
-              'Skye encountered an error while processing that action.',
+              'Relive encountered an error while processing that action.'
             ephemeral: true,
           })
           .catch(() => {});

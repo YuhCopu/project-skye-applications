@@ -1,5 +1,5 @@
 {
-  "name": "skye-applications",
+  "name": "relive-applications",
   "private": true,
   "workspaces": [
     "dashboard",
