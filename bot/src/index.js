@@ -1,18 +1,18 @@
 import 'dotenv/config';
-import http from 'http';
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import http from 'node:http';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   Client,
   GatewayIntentBits,
-  Partials,
+  PermissionsBitField,
+  EmbedBuilder,
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  EmbedBuilder,
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
@@ -21,13 +21,16 @@ import {
 import {
   load,
   save,
+  nextId,
+  addSubmission,
+  updateSubmission,
   allSubmissions,
   defaults,
-  updateSubmission,
 } from './config.js';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+/* =========================================================
+   BASIC SETUP
+========================================================= */
 
 const client = new Client({
   intents: [
@@ -36,91 +39,96 @@ const client = new Client({
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.MessageContent,
   ],
-  partials: [Partials.Channel],
+  partials: ['CHANNEL'],
 });
 
-const cfg = load();
+let cfg = load();
+
+/*
+ * IMPORTANT:
+ * dashboardPort must exist BEFORE oauthRedirect is created.
+ * This fixes the Render ReferenceError.
+ */
+let dashboardPort = Number(process.env.DASHBOARD_PORT || 8787);
+
+const dashboardStarted = false;
 
 const sessions = new Map();
 const dashboardSessions = new Map();
 
-const trustedUsers = new Set(
-  String(
-    process.env.TRUSTED_USER_IDS ||
-      process.env.TRUSTED_USERS ||
-      ''
-  )
+const timeoutMs = 3 * 60 * 60 * 1000;
+
+function envList(name) {
+  return String(process.env[name] || '')
     .split(',')
     .map((x) => x.trim())
-    .filter(Boolean)
-);
-
-if (process.env.TRUSTED_USER_ID) {
-  trustedUsers.add(process.env.TRUSTED_USER_ID.trim());
+    .filter(Boolean);
 }
 
-const publicUrl =
-  process.env.PUBLIC_URL ||
-  'https://project-skye-applications.onrender.com';
+const bootstrapTrusted = new Set(envList('TRUSTED_USER_IDS'));
+
+if (bootstrapTrusted.size) {
+  cfg.trustedUserIds = [
+    ...new Set([
+      ...(cfg.trustedUserIds || []),
+      ...bootstrapTrusted,
+    ]),
+  ];
+
+  save(cfg);
+}
+
+const publicUrl = String(process.env.PUBLIC_URL || '').replace(/\/$/, '');
 
 const oauthRedirect =
   process.env.DISCORD_OAUTH_REDIRECT ||
-  'https://project-skye-applications.onrender.com/oauth/callback';
+  `${publicUrl || `http://127.0.0.1:${dashboardPort}`}/oauth/callback`;
 
 const oauthConfigured = Boolean(
-  process.env.CLIENT_ID &&
-    process.env.DISCORD_CLIENT_SECRET
-);
-
-const dashboardPort = Number(
-  process.env.PORT ||
-    process.env.DASHBOARD_PORT ||
-    8787
+  process.env.DISCORD_CLIENT_SECRET &&
+  process.env.CLIENT_ID
 );
 
 /* =========================================================
-   HELPERS
+   DASHBOARD PATH
 ========================================================= */
 
-function json(res, status, data) {
-  const body = JSON.stringify(data);
+const dashboardDist = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../../dashboard/site'
+);
 
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(body),
-    'Cache-Control': 'no-store',
-  });
+/* =========================================================
+   AUTH / COOKIES
+========================================================= */
 
-  res.end(body);
+function cookieMap(req) {
+  const out = {};
+
+  for (const part of String(req.headers.cookie || '').split(';')) {
+    const [k, ...v] = part.trim().split('=');
+
+    if (k) {
+      out[k] = decodeURIComponent(v.join('='));
+    }
+  }
+
+  return out;
 }
 
-function html(res, status, body, headers = {}) {
-  res.writeHead(status, {
-    'Content-Type': 'text/html; charset=utf-8',
-    'Cache-Control': 'no-store',
-    ...headers,
-  });
-
-  res.end(body);
-}
-
-function redirect(res, location, extraHeaders = {}) {
-  res.writeHead(302, {
-    Location: location,
-    ...extraHeaders,
-  });
-
-  res.end();
-}
-
-function cookie(name, value, maxAge = 3600, httpOnly = true) {
+function cookie(
+  name,
+  value,
+  maxAge = 604800,
+  secure = Boolean(publicUrl.startsWith('https://'))
+) {
   return [
     `${name}=${encodeURIComponent(value)}`,
     'Path=/',
-    `Max-Age=${maxAge}`,
+    'HttpOnly',
     'SameSite=Lax',
-    'Secure',
-    httpOnly ? 'HttpOnly' : '',
+    `Max-Age=${maxAge}`,
+    secure ? 'Secure' : '',
   ]
     .filter(Boolean)
     .join('; ');
@@ -130,93 +138,82 @@ function clearCookie(name) {
   return [
     `${name}=`,
     'Path=/',
-    'Max-Age=0',
-    'SameSite=Lax',
-    'Secure',
     'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=0',
   ].join('; ');
 }
 
-function parseCookies(req) {
-  const result = {};
+function trusted(id) {
+  return (cfg.trustedUserIds || []).includes(id);
+}
 
-  const raw = req.headers.cookie || '';
+function sessionUser(req) {
+  const token = cookieMap(req).skye_session;
 
-  for (const part of raw.split(';')) {
-    const index = part.indexOf('=');
+  if (!token) return null;
 
-    if (index === -1) continue;
+  return dashboardSessions.get(token) || null;
+}
 
-    const key = part.slice(0, index).trim();
-    const value = part.slice(index + 1).trim();
+function authRequired(req, res) {
+  const user = sessionUser(req);
 
-    result[key] = decodeURIComponent(value);
+  if (!user) {
+    res.writeHead(302, {
+      Location: '/login',
+    });
+
+    res.end();
+    return null;
   }
 
-  return result;
-}
-
-function getRequestBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-
-    req.on('data', (chunk) => {
-      body += chunk;
-
-      if (body.length > 2_000_000) {
-        reject(new Error('Request body too large.'));
-        req.destroy();
-      }
+  if (!trusted(user.id)) {
+    res.writeHead(403, {
+      'Content-Type': 'text/html; charset=utf-8',
     });
 
-    req.on('end', () => {
-      if (!body) {
-        resolve({});
-        return;
-      }
+    res.end(`
+      <!doctype html>
+      <html>
+      <head>
+        <meta charset="utf-8">
+        <title>Skye Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+      </head>
+      <body style="font-family:system-ui;background:#090b0f;color:#e8ecf5;display:grid;place-items:center;height:100vh;margin:0">
+        <main style="max-width:520px;padding:30px;border:1px solid #272d39;border-radius:14px;background:#0e1218">
+          <h2>Skye Dashboard</h2>
+          <p>Your Discord account is authenticated, but it is not registered as a trusted dashboard user.</p>
+          <p>Ask the Skye owner to add your Discord user ID to the trusted users list.</p>
+          <a href="/logout" style="color:#aebfff">Sign out</a>
+        </main>
+      </body>
+      </html>
+    `);
 
-      try {
-        resolve(JSON.parse(body));
-      } catch {
-        reject(new Error('Invalid JSON.'));
-      }
-    });
+    return null;
+  }
 
-    req.on('error', reject);
-  });
-}
-
-function isTrusted(userId) {
-  return trustedUsers.has(String(userId));
-}
-
-function makeId(prefix = 'id') {
-  return `${prefix}_${crypto.randomBytes(10).toString('hex')}`;
-}
-
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
+  return user;
 }
 
 /* =========================================================
-   OAUTH
+   OAUTH STATE
 ========================================================= */
 
 /*
- * IMPORTANT:
+ * Render can restart the Node process at any time.
  *
- * OAuth state is now stateless.
+ * The old version stored OAuth states in a Map:
  *
- * We sign the state with the Discord client secret instead
- * of keeping it in a memory Map.
+ *   oauthStates.set(...)
  *
- * This means Render restarts / multiple instances will not
- * destroy the OAuth state.
+ * That means a restart between login and callback caused:
+ *
+ *   Invalid or expired OAuth state.
+ *
+ * Instead, the state is now cryptographically signed.
  */
 
 function oauthStateSecret() {
@@ -261,12 +258,12 @@ function verifyOAuthState(state) {
     .update(encoded)
     .digest('base64url');
 
-  const a = Buffer.from(signature);
-  const b = Buffer.from(expected);
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
 
   if (
-    a.length !== b.length ||
-    !crypto.timingSafeEqual(a, b)
+    actualBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(actualBuffer, expectedBuffer)
   ) {
     return false;
   }
@@ -282,1489 +279,2541 @@ function verifyOAuthState(state) {
 
     const age = Date.now() - Number(payload.createdAt);
 
-    if (age < 0 || age > 10 * 60 * 1000) {
-      return false;
-    }
-
-    return true;
+    return age >= 0 && age <= 10 * 60 * 1000;
   } catch {
     return false;
   }
 }
 
+/* =========================================================
+   OAUTH LOGIN
+========================================================= */
+
 function oauthLogin(req, res) {
   if (!oauthConfigured) {
-    html(
-      res,
-      500,
-      `
-      <!doctype html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <title>OAuth not configured</title>
-        </head>
-        <body style="font-family:Arial;padding:40px">
-          <h1>Discord OAuth is not configured</h1>
-          <p>CLIENT_ID and DISCORD_CLIENT_SECRET must be configured in Render.</p>
-        </body>
-      </html>
-      `
-    );
+    res.writeHead(503, {
+      'Content-Type': 'text/html; charset=utf-8',
+    });
 
-    return;
+    return res.end(`
+      <h2>Discord login is not configured.</h2>
+      <p>Set DISCORD_CLIENT_SECRET and CLIENT_ID in Render.</p>
+    `);
   }
 
   const state = createOAuthState();
 
+  const redirect =
+    oauthRedirect ||
+    `http://${req.headers.host || `127.0.0.1:${dashboardPort}`}/oauth/callback`;
+
+  /*
+   * IMPORTANT:
+   * state is included in the actual Discord OAuth URL.
+   */
   const params = new URLSearchParams({
     client_id: process.env.CLIENT_ID,
     response_type: 'code',
-    redirect_uri: oauthRedirect,
+    redirect_uri: redirect,
     scope: 'identify',
     state,
   });
 
-  const authorizeUrl =
-    'https://discord.com/oauth2/authorize?' +
-    params.toString();
+  res.writeHead(302, {
+    Location: `https://discord.com/oauth2/authorize?${params.toString()}`,
+    'Set-Cookie': cookie('skye_oauth_state', state, 600),
+  });
 
-  console.log('[OAUTH] Starting login');
-  console.log('[OAUTH] Redirect URI:', oauthRedirect);
-  console.log('[OAUTH] State generated:', state.slice(0, 20) + '...');
-
-  redirect(res, authorizeUrl);
+  res.end();
 }
+
+/* =========================================================
+   OAUTH CALLBACK
+========================================================= */
 
 async function oauthCallback(req, res, url) {
-  const code = url.searchParams.get('code');
-  const state = url.searchParams.get('state');
-  const error = url.searchParams.get('error');
+  const state = url.searchParams.get('state') || '';
+  const cookies = cookieMap(req);
 
-  console.log('[OAUTH CALLBACK] Received callback');
-  console.log(
-    '[OAUTH CALLBACK] State received:',
-    state ? `${state.slice(0, 20)}...` : 'MISSING'
-  );
+  /*
+   * Validate the signed state.
+   *
+   * We also check the browser cookie when available.
+   */
+  if (!verifyOAuthState(state)) {
+    res.writeHead(400, {
+      'Content-Type': 'text/plain; charset=utf-8',
+    });
 
-  if (error) {
-    console.error(
-      '[OAUTH CALLBACK] Discord returned error:',
-      error
-    );
-
-    html(
-      res,
-      400,
-      `
-      <!doctype html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <title>Discord Login Error</title>
-        </head>
-        <body style="font-family:Arial;padding:40px">
-          <h1>Discord login failed</h1>
-          <p>${escapeHtml(error)}</p>
-          <p><a href="/login">Try again</a></p>
-        </body>
-      </html>
-      `
-    );
-
-    return;
+    return res.end('Invalid or expired OAuth state.');
   }
+
+  if (
+    cookies.skye_oauth_state &&
+    cookies.skye_oauth_state !== state
+  ) {
+    res.writeHead(400, {
+      'Content-Type': 'text/plain; charset=utf-8',
+    });
+
+    return res.end('Invalid OAuth session.');
+  }
+
+  const code = url.searchParams.get('code');
 
   if (!code) {
-    html(
-      res,
-      400,
-      `
-      <!doctype html>
-      <html>
-        <body style="font-family:Arial;padding:40px">
-          <h1>Missing OAuth code</h1>
-          <p><a href="/login">Try again</a></p>
-        </body>
-      </html>
-      `
-    );
-
-    return;
-  }
-
-  if (!state || !verifyOAuthState(state)) {
-    console.error('[OAUTH CALLBACK] Invalid or expired OAuth state.');
-
-    html(
-      res,
-      400,
-      `
-      <!doctype html>
-      <html>
-        <head>
-          <meta charset="utf-8">
-          <title>OAuth Error</title>
-        </head>
-        <body style="font-family:Arial;padding:40px">
-          <h1>Invalid or expired OAuth state.</h1>
-          <p>Please start the Discord login again.</p>
-          <p><a href="/login">Try again</a></p>
-        </body>
-      </html>
-      `
-    );
-
-    return;
-  }
-
-  try {
-    console.log('[OAUTH CALLBACK] State verified.');
-    console.log('[OAUTH CALLBACK] Exchanging code with Discord...');
-
-    const tokenResponse = await fetch(
-      'https://discord.com/api/oauth2/token',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type':
-            'application/x-www-form-urlencoded',
-        },
-        body: new URLSearchParams({
-          client_id: process.env.CLIENT_ID,
-          client_secret: process.env.DISCORD_CLIENT_SECRET,
-          grant_type: 'authorization_code',
-          code,
-          redirect_uri: oauthRedirect,
-        }),
-      }
-    );
-
-    const tokenText = await tokenResponse.text();
-
-    if (!tokenResponse.ok) {
-      console.error(
-        '[OAUTH CALLBACK] Token exchange failed:',
-        tokenResponse.status,
-        tokenText
-      );
-
-      html(
-        res,
-        500,
-        `
-        <!doctype html>
-        <html>
-          <body style="font-family:Arial;padding:40px">
-            <h1>Discord OAuth token exchange failed</h1>
-            <p>Check the Render logs for details.</p>
-            <p><a href="/login">Try again</a></p>
-          </body>
-        </html>
-        `
-      );
-
-      return;
-    }
-
-    const token = JSON.parse(tokenText);
-
-    const userResponse = await fetch(
-      'https://discord.com/api/users/@me',
-      {
-        headers: {
-          Authorization: `${token.token_type} ${token.access_token}`,
-        },
-      }
-    );
-
-    if (!userResponse.ok) {
-      console.error(
-        '[OAUTH CALLBACK] Failed to fetch Discord user:',
-        userResponse.status
-      );
-
-      html(
-        res,
-        500,
-        `
-        <!doctype html>
-        <html>
-          <body style="font-family:Arial;padding:40px">
-            <h1>Could not read your Discord account.</h1>
-            <p><a href="/login">Try again</a></p>
-          </body>
-        </html>
-        `
-      );
-
-      return;
-    }
-
-    const user = await userResponse.json();
-
-    console.log(
-      '[OAUTH CALLBACK] Logged in Discord user:',
-      user.username,
-      user.id
-    );
-
-    const sessionId = crypto
-      .randomBytes(32)
-      .toString('hex');
-
-    dashboardSessions.set(sessionId, {
-      userId: user.id,
-      username: user.username,
-      avatar: user.avatar || null,
-      createdAt: Date.now(),
-      expires: Date.now() + 24 * 60 * 60 * 1000,
+    res.writeHead(400, {
+      'Content-Type': 'text/plain; charset=utf-8',
     });
 
-    redirect(res, '/', {
-      'Set-Cookie': cookie(
-        'skye_dashboard_session',
-        sessionId,
-        24 * 60 * 60,
-        true
-      ),
-    });
-  } catch (error) {
-    console.error('[OAUTH CALLBACK] Unexpected error:', error);
-
-    html(
-      res,
-      500,
-      `
-      <!doctype html>
-      <html>
-        <body style="font-family:Arial;padding:40px">
-          <h1>Discord login failed</h1>
-          <p>An unexpected error occurred.</p>
-          <p><a href="/login">Try again</a></p>
-        </body>
-      </html>
-      `
-    );
-  }
-}
-
-/* =========================================================
-   DASHBOARD AUTH
-========================================================= */
-
-function getDashboardSession(req) {
-  const cookies = parseCookies(req);
-
-  const sessionId =
-    cookies.skye_dashboard_session;
-
-  if (!sessionId) {
-    return null;
+    return res.end('Discord OAuth was cancelled or failed.');
   }
 
-  const session = dashboardSessions.get(sessionId);
-
-  if (!session) {
-    return null;
-  }
-
-  if (session.expires < Date.now()) {
-    dashboardSessions.delete(sessionId);
-    return null;
-  }
-
-  return session;
-}
-
-function requireDashboardAuth(req, res) {
-  const session = getDashboardSession(req);
-
-  if (!session) {
-    json(res, 401, {
-      error: 'Not authenticated.',
-    });
-
-    return null;
-  }
-
-  return session;
-}
-
-function requireTrustedDashboard(req, res) {
-  const session = requireDashboardAuth(req, res);
-
-  if (!session) {
-    return null;
-  }
-
-  if (!isTrusted(session.userId)) {
-    json(res, 403, {
-      error: 'You are not a trusted Skye administrator.',
-    });
-
-    return null;
-  }
-
-  return session;
-}
-
-/* =========================================================
-   DASHBOARD HTML
-========================================================= */
-
-function dashboardPage() {
-  return `
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Skye Applications</title>
-
-  <style>
-    * {
-      box-sizing: border-box;
+  const tokenRes = await fetch(
+    'https://discord.com/api/oauth2/token',
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type':
+          'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        client_id: process.env.CLIENT_ID,
+        client_secret: process.env.DISCORD_CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: oauthRedirect,
+      }),
     }
-
-    body {
-      margin: 0;
-      font-family: Inter, Arial, sans-serif;
-      background: #0d1117;
-      color: #f0f6fc;
-    }
-
-    a {
-      color: inherit;
-    }
-
-    .wrap {
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 32px 20px;
-    }
-
-    .top {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 20px;
-      margin-bottom: 30px;
-    }
-
-    .brand h1 {
-      margin: 0;
-      font-size: 30px;
-    }
-
-    .brand p {
-      margin: 6px 0 0;
-      color: #8b949e;
-    }
-
-    .button {
-      display: inline-block;
-      padding: 11px 16px;
-      border-radius: 8px;
-      text-decoration: none;
-      border: 1px solid #30363d;
-      background: #161b22;
-      color: #fff;
-      cursor: pointer;
-    }
-
-    .button.primary {
-      background: #5865f2;
-      border-color: #5865f2;
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit,minmax(220px,1fr));
-      gap: 16px;
-    }
-
-    .card {
-      background: #161b22;
-      border: 1px solid #30363d;
-      border-radius: 12px;
-      padding: 20px;
-      margin-bottom: 20px;
-    }
-
-    .stat {
-      font-size: 34px;
-      font-weight: 700;
-      margin-top: 8px;
-    }
-
-    .muted {
-      color: #8b949e;
-    }
-
-    table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    th,
-    td {
-      padding: 12px;
-      border-bottom: 1px solid #30363d;
-      text-align: left;
-      vertical-align: top;
-    }
-
-    th {
-      color: #8b949e;
-      font-weight: 600;
-    }
-
-    pre {
-      white-space: pre-wrap;
-      word-break: break-word;
-      background: #0d1117;
-      padding: 12px;
-      border-radius: 8px;
-    }
-
-    .error {
-      color: #ff7b72;
-    }
-
-    .success {
-      color: #7ee787;
-    }
-
-    @media (max-width: 700px) {
-      .top {
-        flex-direction: column;
-        align-items: flex-start;
-      }
-
-      table {
-        font-size: 13px;
-      }
-    }
-  </style>
-</head>
-
-<body>
-  <div class="wrap">
-    <div class="top">
-      <div class="brand">
-        <h1>Skye Applications</h1>
-        <p>Application dashboard</p>
-      </div>
-
-      <div>
-        <a class="button" href="/api/logout">Logout</a>
-      </div>
-    </div>
-
-    <div id="app">
-      <div class="card">
-        Loading dashboard...
-      </div>
-    </div>
-  </div>
-
-<script>
-async function api(url, options = {}) {
-  const response = await fetch(url, {
-    credentials: 'same-origin',
-    ...options
-  });
-
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    throw new Error(data.error || 'Request failed');
-  }
-
-  return data;
-}
-
-function esc(value) {
-  return String(value ?? '')
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#039;');
-}
-
-async function loadDashboard() {
-  const app = document.getElementById('app');
-
-  try {
-    const me = await api('/api/me');
-
-    if (!me.authenticated) {
-      window.location.href = '/login';
-      return;
-    }
-
-    if (!me.trusted) {
-      app.innerHTML = \`
-        <div class="card">
-          <h2>Access denied</h2>
-          <p class="muted">
-            Your Discord account is not configured as a trusted administrator.
-          </p>
-        </div>
-      \`;
-      return;
-    }
-
-    const [config, submissions] = await Promise.all([
-      api('/api/config'),
-      api('/api/submissions')
-    ]);
-
-    const list = submissions.submissions || [];
-
-    const pending = list.filter(
-      x => String(x.status || '').toLowerCase() === 'pending'
-    ).length;
-
-    const accepted = list.filter(
-      x => String(x.status || '').toLowerCase() === 'accepted'
-    ).length;
-
-    const denied = list.filter(
-      x => String(x.status || '').toLowerCase() === 'denied'
-    ).length;
-
-    app.innerHTML = \`
-      <div class="grid">
-        <div class="card">
-          <div class="muted">Total Applications</div>
-          <div class="stat">\${list.length}</div>
-        </div>
-
-        <div class="card">
-          <div class="muted">Pending</div>
-          <div class="stat">\${pending}</div>
-        </div>
-
-        <div class="card">
-          <div class="muted">Accepted</div>
-          <div class="stat">\${accepted}</div>
-        </div>
-
-        <div class="card">
-          <div class="muted">Denied</div>
-          <div class="stat">\${denied}</div>
-        </div>
-      </div>
-
-      <div class="card">
-        <h2>Configuration</h2>
-        <pre>\${esc(JSON.stringify(config.config, null, 2))}</pre>
-      </div>
-
-      <div class="card">
-        <h2>Applications</h2>
-
-        <div style="overflow:auto">
-          <table>
-            <thead>
-              <tr>
-                <th>ID</th>
-                <th>User</th>
-                <th>Status</th>
-                <th>Created</th>
-                <th>Answers</th>
-              </tr>
-            </thead>
-
-            <tbody>
-              \${list.length
-                ? list.map(item => \`
-                  <tr>
-                    <td>\${esc(item.id || '')}</td>
-                    <td>
-                      <strong>\${esc(item.username || item.userId || 'Unknown')}</strong>
-                      <br>
-                      <span class="muted">\${esc(item.userId || '')}</span>
-                    </td>
-                    <td>\${esc(item.status || 'pending')}</td>
-                    <td>\${item.createdAt ? new Date(item.createdAt).toLocaleString() : ''}</td>
-                    <td>
-                      <pre>\${esc(JSON.stringify(item.answers || item.responses || {}, null, 2))}</pre>
-                    </td>
-                  </tr>
-                \`).join('')
-                : '<tr><td colspan="5">No applications yet.</td></tr>'
-              }
-            </tbody>
-          </table>
-        </div>
-      </div>
-    \`;
-  } catch (error) {
-    app.innerHTML = \`
-      <div class="card">
-        <h2 class="error">Dashboard error</h2>
-        <p>\${esc(error.message)}</p>
-      </div>
-    \`;
-  }
-}
-
-loadDashboard();
-</script>
-</body>
-</html>
-`;
-}
-
-/* =========================================================
-   DASHBOARD API
-========================================================= */
-
-async function handleDashboard(req, res, url) {
-  if (url.pathname === '/login') {
-    oauthLogin(req, res);
-    return;
-  }
-
-  if (url.pathname === '/oauth/callback') {
-    await oauthCallback(req, res, url);
-    return;
-  }
-
-  if (url.pathname === '/api/logout') {
-    const cookies = parseCookies(req);
-
-    if (cookies.skye_dashboard_session) {
-      dashboardSessions.delete(
-        cookies.skye_dashboard_session
-      );
-    }
-
-    redirect(res, '/login', {
-      'Set-Cookie': clearCookie(
-        'skye_dashboard_session'
-      ),
-    });
-
-    return;
-  }
-
-  if (url.pathname === '/api/health') {
-    json(res, 200, {
-      ok: true,
-      service: 'Skye Applications',
-      online: client.isReady(),
-      user: client.user
-        ? `${client.user.username}#${client.user.discriminator}`
-        : null,
-      timestamp: Date.now(),
-    });
-
-    return;
-  }
-
-  if (url.pathname === '/api/me') {
-    const session = getDashboardSession(req);
-
-    json(res, 200, {
-      authenticated: Boolean(session),
-      trusted: session
-        ? isTrusted(session.userId)
-        : false,
-      user: session
-        ? {
-            id: session.userId,
-            username: session.username,
-            avatar: session.avatar,
-          }
-        : null,
-    });
-
-    return;
-  }
-
-  if (url.pathname === '/api/config') {
-    const session = requireTrustedDashboard(req, res);
-
-    if (!session) return;
-
-    json(res, 200, {
-      config: cfg,
-    });
-
-    return;
-  }
-
-  if (url.pathname === '/api/submissions') {
-    const session = requireTrustedDashboard(req, res);
-
-    if (!session) return;
-
-    json(res, 200, {
-      submissions: allSubmissions(),
-    });
-
-    return;
-  }
-
-  if (url.pathname === '/api/trusted') {
-    const session = requireTrustedDashboard(req, res);
-
-    if (!session) return;
-
-    json(res, 200, {
-      trustedUsers: [...trustedUsers],
-    });
-
-    return;
-  }
-
-  if (
-    url.pathname === '/api/reset' &&
-    req.method === 'POST'
-  ) {
-    const session = requireTrustedDashboard(req, res);
-
-    if (!session) return;
-
-    save(defaults);
-
-    json(res, 200, {
-      ok: true,
-      message: 'Configuration reset.',
-    });
-
-    return;
-  }
-
-  if (url.pathname === '/' || url.pathname === '/index.html') {
-    const session = getDashboardSession(req);
-
-    if (!session) {
-      redirect(res, '/login');
-      return;
-    }
-
-    html(res, 200, dashboardPage());
-    return;
-  }
-
-  const sitePath = path.resolve(
-    __dirname,
-    '../../dashboard/site'
   );
 
-  let requestedPath = url.pathname;
+  if (!tokenRes.ok) {
+    const errorText = await tokenRes.text().catch(() => '');
 
-  if (requestedPath === '/') {
-    requestedPath = '/index.html';
-  }
-
-  const filePath = path.join(
-    sitePath,
-    requestedPath
-  );
-
-  if (
-    filePath.startsWith(sitePath) &&
-    fs.existsSync(filePath) &&
-    fs.statSync(filePath).isFile()
-  ) {
-    const ext = path.extname(filePath);
-
-    const types = {
-      '.html': 'text/html; charset=utf-8',
-      '.css': 'text/css; charset=utf-8',
-      '.js': 'application/javascript; charset=utf-8',
-      '.json': 'application/json; charset=utf-8',
-      '.png': 'image/png',
-      '.jpg': 'image/jpeg',
-      '.jpeg': 'image/jpeg',
-      '.svg': 'image/svg+xml',
-      '.ico': 'image/x-icon',
-    };
-
-    res.writeHead(200, {
-      'Content-Type':
-        types[ext] || 'application/octet-stream',
-    });
-
-    fs.createReadStream(filePath).pipe(res);
-    return;
-  }
-
-  json(res, 404, {
-    error: 'Not found.',
-  });
-}
-
-/* =========================================================
-   APPLICATION SYSTEM
-========================================================= */
-
-const applicationSessions = new Map();
-
-function getApplicationQuestions() {
-  return (
-    cfg.applicationQuestions ||
-    cfg.questions ||
-    defaults.applicationQuestions ||
-    defaults.questions ||
-    [
-      'What is your Discord username?',
-      'How old are you?',
-      'Why do you want to join?',
-      'What experience do you have?',
-      'Anything else we should know?',
-    ]
-  );
-}
-
-function applicationChannelId() {
-  return (
-    cfg.applicationChannelId ||
-    cfg.application_channel_id ||
-    process.env.APPLICATION_CHANNEL_ID ||
-    null
-  );
-}
-
-function reviewChannelId() {
-  return (
-    cfg.reviewChannelId ||
-    cfg.review_channel_id ||
-    process.env.REVIEW_CHANNEL_ID ||
-    applicationChannelId()
-  );
-}
-
-function applicationRoleId() {
-  return (
-    cfg.applicationRoleId ||
-    cfg.application_role_id ||
-    process.env.APPLICATION_ROLE_ID ||
-    null
-  );
-}
-
-function buildApplicationEmbed() {
-  return new EmbedBuilder()
-    .setTitle(
-      cfg.applicationTitle ||
-        'Skye Applications'
-    )
-    .setDescription(
-      cfg.applicationDescription ||
-        'Click the button below to start an application.'
-    )
-    .setColor(0x5865f2);
-}
-
-function buildApplicationRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId('skye_application_start')
-      .setLabel(
-        cfg.applicationButtonLabel ||
-          'Start Application'
-      )
-      .setStyle(ButtonStyle.Primary)
-  );
-}
-
-async function sendApplicationPanel() {
-  const channelId = applicationChannelId();
-
-  if (!channelId) {
-    console.log(
-      '[APPLICATIONS] No application channel configured.'
-    );
-    return;
-  }
-
-  try {
-    const channel = await client.channels.fetch(
-      channelId
-    );
-
-    if (!channel || !channel.isTextBased()) {
-      console.log(
-        '[APPLICATIONS] Application channel is not text based.'
-      );
-      return;
-    }
-
-    await channel.send({
-      embeds: [buildApplicationEmbed()],
-      components: [buildApplicationRow()],
-    });
-
-    console.log(
-      '[APPLICATIONS] Application panel sent.'
-    );
-  } catch (error) {
     console.error(
-      '[APPLICATIONS] Failed to send panel:',
-      error
+      'Discord OAuth token exchange failed:',
+      tokenRes.status,
+      errorText
+    );
+
+    res.writeHead(502, {
+      'Content-Type': 'text/plain; charset=utf-8',
+    });
+
+    return res.end('Discord token exchange failed.');
+  }
+
+  const token = await tokenRes.json();
+
+  const meRes = await fetch(
+    'https://discord.com/api/users/@me',
+    {
+      headers: {
+        Authorization: `Bearer ${token.access_token}`,
+      },
+    }
+  );
+
+  if (!meRes.ok) {
+    res.writeHead(502, {
+      'Content-Type': 'text/plain; charset=utf-8',
+    });
+
+    return res.end(
+      'Could not read your Discord account.'
     );
   }
-}
 
-async function startApplication(interaction) {
-  const userId = interaction.user.id;
+  const me = await meRes.json();
 
-  if (applicationSessions.has(userId)) {
-    await interaction.reply({
-      content:
-        'You already have an application in progress.',
-      ephemeral: true,
-    });
+  const session = crypto
+    .randomBytes(32)
+    .toString('hex');
 
-    return;
-  }
-
-  const questions = getApplicationQuestions();
-
-  if (!questions.length) {
-    await interaction.reply({
-      content:
-        'No application questions are configured.',
-      ephemeral: true,
-    });
-
-    return;
-  }
-
-  applicationSessions.set(userId, {
-    userId,
-    username: interaction.user.username,
-    answers: {},
-    questionIndex: 0,
+  dashboardSessions.set(session, {
+    id: me.id,
+    username: me.username,
+    global_name: me.global_name || me.username,
+    avatar: me.avatar || null,
     createdAt: Date.now(),
-    expires: Date.now() + 3 * 60 * 60 * 1000,
   });
 
-  await interaction.reply({
-    content:
-      'Your application has started. I will DM you the questions.',
-    ephemeral: true,
+  res.writeHead(302, {
+    Location: '/',
+    'Set-Cookie': [
+      cookie('skye_session', session),
+      clearCookie('skye_oauth_state'),
+    ],
   });
 
-  try {
-    const dm = await interaction.user.createDM();
-
-    await dm.send(
-      `**${cfg.applicationTitle || 'Skye Application'}**\n\n` +
-        `You have 3 hours to complete your application.\n\n` +
-        `Question 1 of ${questions.length}:\n**${questions[0]}**`
-    );
-  } catch (error) {
-    applicationSessions.delete(userId);
-
-    console.error(
-      '[APPLICATIONS] Could not DM applicant:',
-      error
-    );
-
-    await interaction.followUp({
-      content:
-        'I could not DM you. Please enable DMs from server members and try again.',
-      ephemeral: true,
-    });
-  }
-}
-
-async function handleApplicationDM(message) {
-  if (message.author.bot) return;
-
-  const session = applicationSessions.get(
-    message.author.id
-  );
-
-  if (!session) return;
-
-  if (session.expires < Date.now()) {
-    applicationSessions.delete(message.author.id);
-
-    await message.reply(
-      'Your application session expired. Please start a new application.'
-    );
-
-    return;
-  }
-
-  const questions = getApplicationQuestions();
-
-  const index = session.questionIndex;
-
-  session.answers[index] = message.content.trim();
-
-  session.questionIndex += 1;
-
-  if (session.questionIndex >= questions.length) {
-    applicationSessions.delete(message.author.id);
-
-    const submission = {
-      id: makeId('application'),
-      userId: message.author.id,
-      username: message.author.username,
-      discriminator: message.author.discriminator,
-      answers: session.answers,
-      questions,
-      status: 'pending',
-      createdAt: Date.now(),
-    };
-
-    updateSubmission(
-      submission.id,
-      submission
-    );
-
-    await message.reply(
-      'Your application has been submitted. Thank you!'
-    );
-
-    await sendApplicationForReview(submission);
-
-    return;
-  }
-
-  const nextQuestion =
-    questions[session.questionIndex];
-
-  await message.reply(
-    `Question ${session.questionIndex + 1} of ${questions.length}:\n**${nextQuestion}**`
-  );
-}
-
-async function sendApplicationForReview(submission) {
-  const channelId = reviewChannelId();
-
-  if (!channelId) {
-    console.log(
-      '[APPLICATIONS] No review channel configured.'
-    );
-    return;
-  }
-
-  try {
-    const channel = await client.channels.fetch(
-      channelId
-    );
-
-    if (!channel || !channel.isTextBased()) {
-      return;
-    }
-
-    const answerText = submission.questions
-      .map(
-        (question, index) =>
-          `**${question}**\n${submission.answers[index] || '(No answer)'}`
-      )
-      .join('\n\n');
-
-    const embed = new EmbedBuilder()
-      .setTitle('New Application')
-      .setDescription(answerText)
-      .addFields(
-        {
-          name: 'Applicant',
-          value: `<@${submission.userId}>`,
-          inline: true,
-        },
-        {
-          name: 'Application ID',
-          value: submission.id,
-          inline: true,
-        },
-        {
-          name: 'Status',
-          value: 'Pending',
-          inline: true,
-        }
-      )
-      .setColor(0xfee75c)
-      .setTimestamp();
-
-    const row = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId(
-          `skye_accept_${submission.id}`
-        )
-        .setLabel('Accept')
-        .setStyle(ButtonStyle.Success),
-
-      new ButtonBuilder()
-        .setCustomId(
-          `skye_deny_${submission.id}`
-        )
-        .setLabel('Deny')
-        .setStyle(ButtonStyle.Danger)
-    );
-
-    const sent = await channel.send({
-      embeds: [embed],
-      components: [row],
-    });
-
-    updateSubmission(submission.id, {
-      reviewMessageId: sent.id,
-      reviewChannelId: channel.id,
-    });
-  } catch (error) {
-    console.error(
-      '[APPLICATIONS] Failed to send review:',
-      error
-    );
-  }
+  res.end();
 }
 
 /* =========================================================
-   REVIEW ACTIONS
+   LOGIN PAGE
 ========================================================= */
 
-async function showDecisionModal(
-  interaction,
-  action,
-  submissionId
-) {
-  const modal = new ModalBuilder()
-    .setCustomId(
-      `skye_${action}_modal_${submissionId}`
-    )
-    .setTitle(
-      action === 'accept'
-        ? 'Accept Application'
-        : 'Deny Application'
-    );
+function authPage() {
+  return `
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8">
+      <title>Skye Dashboard Login</title>
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+    </head>
+    <body style="font-family:system-ui;background:#090b0f;color:#e8ecf5;display:grid;place-items:center;height:100vh;margin:0">
+      <main style="width:min(420px,calc(100% - 32px));padding:30px;border:1px solid #272d39;border-radius:16px;background:#0e1218;text-align:center">
+        <div style="font-size:38px">☁️</div>
+        <h1>Skye Applications</h1>
+        <p style="color:#7f899b">Private dashboard. Discord authentication is required.</p>
 
-  const reason = new TextInputBuilder()
-    .setCustomId('reason')
-    .setLabel(
-      action === 'accept'
-        ? 'Acceptance message'
-        : 'Denial reason'
-    )
-    .setStyle(TextInputStyle.Paragraph)
-    .setRequired(false)
-    .setPlaceholder(
-      action === 'accept'
-        ? 'Optional message to the applicant'
-        : 'Explain why the application was denied'
-    );
-
-  modal.addComponents(
-    new ActionRowBuilder().addComponents(reason)
-  );
-
-  await interaction.showModal(modal);
-}
-
-async function handleDecisionModal(interaction) {
-  const parts = interaction.customId.split('_');
-
-  if (parts.length < 4) {
-    return;
-  }
-
-  const action = parts[1];
-  const submissionId = parts.slice(3).join('_');
-
-  const submission =
-    allSubmissions().find(
-      (item) => item.id === submissionId
-    );
-
-  if (!submission) {
-    await interaction.reply({
-      content: 'Application not found.',
-      ephemeral: true,
-    });
-
-    return;
-  }
-
-  const reason =
-    interaction.fields.getTextInputValue(
-      'reason'
-    ) || '';
-
-  const status =
-    action === 'accept'
-      ? 'accepted'
-      : 'denied';
-
-  updateSubmission(submissionId, {
-    status,
-    decisionReason: reason,
-    decidedBy: interaction.user.id,
-    decidedByUsername: interaction.user.username,
-    decidedAt: Date.now(),
-  });
-
-  try {
-    const user = await client.users.fetch(
-      submission.userId
-    );
-
-    const message =
-      status === 'accepted'
-        ? `Your application has been **accepted**!${
-            reason ? `\n\n${reason}` : ''
-          }`
-        : `Your application has been **denied**.${
-            reason ? `\n\nReason: ${reason}` : ''
-          }`;
-
-    await user.send(message);
-  } catch (error) {
-    console.error(
-      '[APPLICATIONS] Could not DM applicant decision:',
-      error
-    );
-  }
-
-  await interaction.reply({
-    content:
-      status === 'accepted'
-        ? 'Application accepted.'
-        : 'Application denied.',
-    ephemeral: true,
-  });
-
-  if (interaction.message) {
-    const disabledRow =
-      new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-          .setCustomId(
-            `skye_done_accept_${submissionId}`
-          )
-          .setLabel(
-            status === 'accepted'
-              ? 'Accepted'
-              : 'Accepted'
-          )
-          .setStyle(ButtonStyle.Success)
-          .setDisabled(true),
-
-        new ButtonBuilder()
-          .setCustomId(
-            `skye_done_deny_${submissionId}`
-          )
-          .setLabel(
-            status === 'denied'
-              ? 'Denied'
-              : 'Denied'
-          )
-          .setStyle(ButtonStyle.Danger)
-          .setDisabled(true)
-      );
-
-    await interaction.message.edit({
-      components: [disabledRow],
-    }).catch(() => {});
-  }
+        <a
+          href="/login/start"
+          style="display:block;padding:12px;border-radius:8px;background:#aebfff;color:#080a0e;text-decoration:none;font-weight:700"
+        >
+          Continue with Discord
+        </a>
+      </main>
+    </body>
+    </html>
+  `;
 }
 
 /* =========================================================
-   COMMANDS / BOT READY
+   HTTP HELPERS
 ========================================================= */
 
-client.once('ready', async () => {
-  console.log(
-    `Skye Applications online as ${client.user.tag}`
-  );
+const json = (res, status, data) => {
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Access-Control-Allow-Origin': '*',
+    'Cache-Control': 'no-store',
+  });
 
-  console.log(
-    `Skye dashboard: http://127.0.0.1:${dashboardPort}`
-  );
+  res.end(JSON.stringify(data));
+};
 
-  try {
-    const guilds = [...client.guilds.cache.values()];
+const readBody = (req) =>
+  new Promise((resolve, reject) => {
+    let body = '';
 
-    for (const guild of guilds) {
-      console.log(
-        `[DISCORD] Connected to ${guild.name} (${guild.id})`
-      );
-    }
-  } catch (error) {
-    console.error(
-      '[DISCORD] Guild logging error:',
-      error
-    );
+    req.on('data', (chunk) => {
+      body += chunk;
+
+      if (body.length > 2_000_000) {
+        req.destroy();
+      }
+    });
+
+    req.on('end', () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (e) {
+        reject(e);
+      }
+    });
+
+    req.on('error', reject);
+  });
+
+/* =========================================================
+   CONFIG VALIDATION
+========================================================= */
+
+function safeConfig(input) {
+  if (!input || typeof input !== 'object') {
+    throw new Error('Invalid configuration.');
   }
-});
 
-client.on('interactionCreate', async (interaction) => {
-  try {
-    if (interaction.isButton()) {
+  const next = structuredClone(defaults);
+
+  const merge = (base, src) => {
+    for (const [key, value] of Object.entries(src || {})) {
       if (
-        interaction.customId ===
-        'skye_application_start'
+        value &&
+        typeof value === 'object' &&
+        !Array.isArray(value) &&
+        base[key] &&
+        typeof base[key] === 'object' &&
+        !Array.isArray(base[key])
       ) {
-        await startApplication(interaction);
-        return;
-      }
-
-      if (
-        interaction.customId.startsWith(
-          'skye_accept_'
-        )
-      ) {
-        const submissionId =
-          interaction.customId.slice(
-            'skye_accept_'.length
-          );
-
-        await showDecisionModal(
-          interaction,
-          'accept',
-          submissionId
-        );
-
-        return;
-      }
-
-      if (
-        interaction.customId.startsWith(
-          'skye_deny_'
-        )
-      ) {
-        const submissionId =
-          interaction.customId.slice(
-            'skye_deny_'.length
-          );
-
-        await showDecisionModal(
-          interaction,
-          'deny',
-          submissionId
-        );
-
-        return;
+        merge(base[key], value);
+      } else if (key in base) {
+        base[key] = value;
       }
     }
+  };
 
-    if (interaction.isModalSubmit()) {
-      if (
-        interaction.customId.startsWith(
-          'skye_accept_modal_'
-        ) ||
-        interaction.customId.startsWith(
-          'skye_deny_modal_'
-        )
-      ) {
-        await handleDecisionModal(interaction);
-        return;
-      }
-    }
-  } catch (error) {
-    console.error(
-      '[INTERACTION ERROR]',
-      error
-    );
+  merge(next, input);
 
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({
-        content:
-          'Something went wrong while processing that action.',
-        ephemeral: true,
-      }).catch(() => {});
-    }
-  }
-});
+  next.trustedUserIds = Array.isArray(
+    input.trustedUserIds
+  )
+    ? input.trustedUserIds
+        .map(String)
+        .filter((x) => /^\d{17,20}$/.test(x))
+    : next.trustedUserIds;
 
-client.on('messageCreate', async (message) => {
-  try {
-    await handleApplicationDM(message);
-  } catch (error) {
-    console.error(
-      '[MESSAGE ERROR]',
-      error
-    );
-  }
-});
+  next.applicationTypes = Array.isArray(
+    input.applicationTypes
+  )
+    ? input.applicationTypes
+        .map((a) => ({
+          ...a,
+          questions: Array.isArray(a.questions)
+            ? a.questions.map(String).filter(Boolean)
+            : [],
+          roles: {
+            onSubmit: a.roles?.onSubmit || [],
+            onAccept: a.roles?.onAccept || [],
+            onDeny: a.roles?.onDeny || [],
+            removeOnAccept:
+              a.roles?.removeOnAccept || [],
+            removeOnDeny:
+              a.roles?.removeOnDeny || [],
+          },
+        }))
+        .filter((a) => a.id && a.name)
+    : next.applicationTypes;
+
+  return next;
+}
 
 /* =========================================================
    DASHBOARD SERVER
 ========================================================= */
 
-const server = http.createServer(
-  async (req, res) => {
+async function handleDashboard(req, res) {
+  const url = new URL(
+    req.url || '/',
+    `http://${req.headers.host || '127.0.0.1'}`
+  );
+
+  /* OPTIONS */
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Methods':
+        'GET,PUT,POST,DELETE,OPTIONS',
+      'Access-Control-Allow-Headers':
+        'Content-Type',
+    });
+
+    return res.end();
+  }
+
+  /* LOGIN */
+
+  if (
+    url.pathname === '/login' &&
+    req.method === 'GET'
+  ) {
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+    });
+
+    return res.end(authPage());
+  }
+
+  if (
+    url.pathname === '/login/start' &&
+    req.method === 'GET'
+  ) {
+    return oauthLogin(req, res);
+  }
+
+  if (
+    url.pathname === '/oauth/callback' &&
+    req.method === 'GET'
+  ) {
+    return oauthCallback(req, res, url);
+  }
+
+  /* LOGOUT */
+
+  if (
+    url.pathname === '/logout' &&
+    req.method === 'GET'
+  ) {
+    res.writeHead(302, {
+      Location: '/login',
+      'Set-Cookie': clearCookie('skye_session'),
+    });
+
+    res.end();
+
+    return;
+  }
+
+  /* PUBLIC HEALTH */
+
+  if (
+    url.pathname === '/api/health' &&
+    req.method === 'GET'
+  ) {
+    return json(res, 200, {
+      online: client.isReady(),
+      tag: client.user?.tag || null,
+      dashboard: true,
+      port: dashboardPort,
+      authRequired: true,
+    });
+  }
+
+  /* EVERYTHING BELOW HERE REQUIRES AUTH */
+
+  const user = authRequired(req, res);
+
+  if (!user) {
+    return;
+  }
+
+  /* CURRENT USER */
+
+  if (
+    url.pathname === '/api/me' &&
+    req.method === 'GET'
+  ) {
+    return json(res, 200, {
+      user,
+      trusted: true,
+    });
+  }
+
+  /* AUTHENTICATED HEALTH */
+
+  if (
+    url.pathname === '/api/health-auth' &&
+    req.method === 'GET'
+  ) {
+    return json(res, 200, {
+      online: client.isReady(),
+      tag: client.user?.tag || null,
+      dashboard: true,
+      port: dashboardPort,
+      authenticated: true,
+      user,
+    });
+  }
+
+  /* GET CONFIG */
+
+  if (
+    url.pathname === '/api/config' &&
+    req.method === 'GET'
+  ) {
+    return json(res, 200, cfg);
+  }
+
+  /* SAVE CONFIG */
+
+  if (
+    url.pathname === '/api/config' &&
+    req.method === 'PUT'
+  ) {
     try {
-      const host =
-        req.headers.host ||
-        '127.0.0.1';
+      cfg = safeConfig(await readBody(req));
 
-      const url = new URL(
-        req.url || '/',
-        `http://${host}`
-      );
+      save(cfg);
 
-      await handleDashboard(
-        req,
-        res,
-        url
+      return json(res, 200, cfg);
+    } catch (e) {
+      return json(res, 400, {
+        error: e.message,
+      });
+    }
+  }
+
+  /* SUBMISSIONS */
+
+  if (
+    url.pathname === '/api/submissions' &&
+    req.method === 'GET'
+  ) {
+    return json(
+      res,
+      200,
+      allSubmissions()
+        .slice()
+        .reverse()
+        .map((x) => ({
+          id: x.id,
+          username: x.username,
+          type: x.type,
+          status: x.status,
+          submittedAt: x.submittedAt,
+        }))
+    );
+  }
+
+  /* PUBLISH PANEL */
+
+  if (
+    url.pathname === '/api/publish-panel' &&
+    req.method === 'POST'
+  ) {
+    try {
+      const { channelId } = await readBody(req);
+
+      if (!client.isReady()) {
+        return json(res, 503, {
+          error: 'Discord bot is not ready yet.',
+        });
+      }
+
+      const channel = await client.channels
+        .fetch(String(channelId))
+        .catch(() => null);
+
+      if (!channel?.isTextBased()) {
+        return json(res, 400, {
+          error:
+            'That channel could not be found or is not a text channel.',
+        });
+      }
+
+      const sent = await channel.send({
+        embeds: [panelEmbed()],
+        components: panelComponents(),
+      });
+
+      return json(res, 200, {
+        ok: true,
+        messageId: sent.id,
+      });
+    } catch (e) {
+      return json(res, 500, {
+        error: e.message,
+      });
+    }
+  }
+
+  /* TRUSTED USERS */
+
+  if (
+    url.pathname === '/api/trusted' &&
+    req.method === 'GET'
+  ) {
+    return json(res, 200, {
+      users: cfg.trustedUserIds || [],
+    });
+  }
+
+  if (
+    url.pathname === '/api/trusted' &&
+    req.method === 'POST'
+  ) {
+    try {
+      const body = await readBody(req);
+
+      const id = String(body.userId || '').trim();
+
+      if (!/^\d{17,20}$/.test(id)) {
+        return json(res, 400, {
+          error: 'Enter a valid Discord user ID.',
+        });
+      }
+
+      cfg.trustedUserIds = [
+        ...new Set([
+          ...(cfg.trustedUserIds || []),
+          id,
+        ]),
+      ];
+
+      save(cfg);
+
+      return json(res, 200, {
+        users: cfg.trustedUserIds,
+      });
+    } catch (e) {
+      return json(res, 400, {
+        error: e.message,
+      });
+    }
+  }
+
+  if (
+    url.pathname === '/api/trusted' &&
+    req.method === 'DELETE'
+  ) {
+    const id = String(
+      url.searchParams.get('userId') || ''
+    );
+
+    if (id === user.id) {
+      return json(res, 400, {
+        error:
+          'You cannot remove your own trusted access from this session.',
+      });
+    }
+
+    cfg.trustedUserIds = (
+      cfg.trustedUserIds || []
+    ).filter((x) => x !== id);
+
+    save(cfg);
+
+    return json(res, 200, {
+      users: cfg.trustedUserIds,
+    });
+  }
+
+  /* RESET */
+
+  if (
+    url.pathname === '/api/reset' &&
+    req.method === 'POST'
+  ) {
+    cfg = structuredClone(defaults);
+
+    cfg.trustedUserIds = [
+      user.id,
+      ...bootstrapTrusted,
+    ];
+
+    save(cfg);
+
+    return json(res, 200, cfg);
+  }
+
+  /* STATIC DASHBOARD FILES */
+
+  if (req.method === 'GET') {
+    const rel =
+      url.pathname === '/'
+        ? 'index.html'
+        : url.pathname.replace(/^\//, '');
+
+    const file = path.resolve(
+      dashboardDist,
+      rel
+    );
+
+    /*
+     * Prevent ../ traversal outside dashboard/site.
+     */
+    if (
+      file.startsWith(dashboardDist) &&
+      fs.existsSync(file) &&
+      fs.statSync(file).isFile()
+    ) {
+      const ext = path.extname(file);
+
+      const types = {
+        '.html': 'text/html; charset=utf-8',
+        '.js': 'text/javascript; charset=utf-8',
+        '.css': 'text/css; charset=utf-8',
+        '.svg': 'image/svg+xml',
+        '.png': 'image/png',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.webp': 'image/webp',
+        '.ico': 'image/x-icon',
+      };
+
+      res.writeHead(200, {
+        'Content-Type':
+          types[ext] ||
+          'application/octet-stream',
+      });
+
+      return res.end(
+        fs.readFileSync(file)
       );
-    } catch (error) {
-      console.error(
-        '[DASHBOARD ERROR]',
-        error
-      );
+    }
+  }
+
+  return json(res, 404, {
+    error: 'Not found',
+  });
+}
+
+/* =========================================================
+   START DASHBOARD SERVER
+========================================================= */
+
+const dashboardServer = http.createServer(
+  (req, res) => {
+    handleDashboard(req, res).catch((e) => {
+      console.error('Dashboard error:', e);
 
       if (!res.headersSent) {
         json(res, 500, {
-          error: 'Internal server error.',
+          error:
+            e.message || 'Dashboard error',
         });
-      } else {
-        res.end();
       }
-    }
+    });
   }
 );
 
-server.listen(
+dashboardServer.on('error', (err) => {
+  if (
+    err.code === 'EADDRINUSE' &&
+    dashboardPort ===
+      Number(process.env.DASHBOARD_PORT || 8787)
+  ) {
+    dashboardPort =
+      Number(process.env.DASHBOARD_PORT || 8787) + 1;
+
+    dashboardServer.listen(
+      dashboardPort,
+      '0.0.0.0',
+      () => {
+        console.log(
+          `Skye dashboard port 8787 was busy. Dashboard: http://127.0.0.1:${dashboardPort}`
+        );
+      }
+    );
+  } else {
+    console.error(
+      'Skye dashboard server error:',
+      err
+    );
+  }
+});
+
+dashboardServer.listen(
   dashboardPort,
   '0.0.0.0',
   () => {
     console.log(
-      `Skye dashboard listening on port ${dashboardPort}`
+      `Skye dashboard: http://127.0.0.1:${dashboardPort}`
     );
   }
 );
 
 /* =========================================================
-   CLEANUP
+   DISCORD HELPERS
+========================================================= */
+
+const accent = () =>
+  cfg.brand?.accent || 0x8FA7FF;
+
+const appType = (id) =>
+  cfg.applicationTypes.find(
+    (a) => a.id === id
+  );
+
+const channelFor = (id) =>
+  cfg.channels?.[id] || '';
+
+const vars = (text, v = {}) =>
+  String(text || '')
+    .replaceAll('{id}', v.id || '')
+    .replaceAll(
+      '{current}',
+      String(v.current || '')
+    )
+    .replaceAll(
+      '{total}',
+      String(v.total || '')
+    )
+    .replaceAll(
+      '{question}',
+      v.question || ''
+    )
+    .replaceAll(
+      '{type}',
+      v.type || ''
+    )
+    .replaceAll(
+      '{reason}',
+      v.reason
+        ? `\n\n**Reason:** ${v.reason}`
+        : ''
+    );
+
+function panelEmbed() {
+  return new EmbedBuilder()
+    .setColor(accent())
+    .setTitle(
+      cfg.panel.title
+    )
+    .setDescription(
+      cfg.panel.description
+    )
+    .setFooter({
+      text:
+        cfg.panel.footer ||
+        cfg.brand.name,
+    })
+    .setTimestamp();
+}
+
+function panelComponents() {
+  const active =
+    cfg.applicationTypes.filter(
+      (a) => a.active !== false
+    );
+
+  const rows = [];
+  let row = new ActionRowBuilder();
+
+  active.forEach((a, i) => {
+    if (i && i % 5 === 0) {
+      rows.push(row);
+      row = new ActionRowBuilder();
+    }
+
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(
+          `skye_apply:${a.id}`
+        )
+        .setLabel(
+          a.name.slice(0, 80)
+        )
+        .setEmoji(
+          a.emoji || '📋'
+        )
+        .setStyle(
+          ButtonStyle.Secondary
+        )
+    );
+  });
+
+  if (row.components.length) {
+    rows.push(row);
+  }
+
+  return rows;
+}
+
+function reviewRows(
+  id,
+  disabled = false
+) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(
+        `skye_accept:${id}`
+      )
+      .setLabel('Accept')
+      .setEmoji('✅')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+
+    new ButtonBuilder()
+      .setCustomId(
+        `skye_accept_reason:${id}`
+      )
+      .setLabel('Accept with Reason')
+      .setEmoji('📝')
+      .setStyle(ButtonStyle.Success)
+      .setDisabled(disabled),
+
+    new ButtonBuilder()
+      .setCustomId(
+        `skye_deny:${id}`
+      )
+      .setLabel('Deny')
+      .setEmoji('⛔')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled),
+
+    new ButtonBuilder()
+      .setCustomId(
+        `skye_deny_reason:${id}`
+      )
+      .setLabel('Deny with Reason')
+      .setEmoji('📝')
+      .setStyle(ButtonStyle.Danger)
+      .setDisabled(disabled),
+
+    new ButtonBuilder()
+      .setCustomId(
+        `skye_details:${id}`
+      )
+      .setLabel('Details')
+      .setEmoji('🔎')
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(disabled)
+  );
+}
+
+function permission(i) {
+  return (
+    i.memberPermissions?.has(
+      PermissionsBitField.Flags.ManageGuild
+    ) ||
+    !cfg.reviewRoleId ||
+    i.member?.roles?.cache?.has(
+      cfg.reviewRoleId
+    )
+  );
+}
+
+async function applyRoles(
+  guild,
+  userId,
+  ids,
+  mode
+) {
+  if (!ids?.length) return;
+
+  const member = await guild.members
+    .fetch(userId)
+    .catch(() => null);
+
+  if (!member) return;
+
+  for (const id of ids) {
+    const role = await guild.roles
+      .fetch(id)
+      .catch(() => null);
+
+    if (!role) continue;
+
+    if (mode === 'add') {
+      await member.roles
+        .add(role)
+        .catch(() => {});
+    } else {
+      await member.roles
+        .remove(role)
+        .catch(() => {});
+    }
+  }
+}
+
+function dmFooter() {
+  return {
+    text: 'Sent By Skye Support',
+  };
+}
+
+function cancelRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(
+        'skye_cancel_application'
+      )
+      .setLabel(
+        'Cancel Application'
+      )
+      .setEmoji('🛑')
+      .setStyle(ButtonStyle.Danger)
+  );
+}
+
+function sourceRow() {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(
+        'skye_dm_source'
+      )
+      .setLabel(
+        'Sent By Skye Support'
+      )
+      .setStyle(
+        ButtonStyle.Secondary
+      )
+      .setDisabled(true)
+  );
+}
+
+function confirmationRows(appId) {
+  return [
+    new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(
+          `skye_dm_start:${appId}`
+        )
+        .setLabel(
+          'Start Application'
+        )
+        .setEmoji('🟢')
+        .setStyle(
+          ButtonStyle.Success
+        ),
+
+      new ButtonBuilder()
+        .setCustomId(
+          'skye_cancel_application'
+        )
+        .setLabel(
+          'Cancel Application'
+        )
+        .setEmoji('🔴')
+        .setStyle(
+          ButtonStyle.Danger
+        )
+    ),
+
+    sourceRow(),
+  ];
+}
+
+function confirmationEmbed(app) {
+  return new EmbedBuilder()
+    .setColor(accent())
+    .setTitle(
+      'Application started'
+    )
+    .setDescription(
+      'Application has been started in your direct messages!'
+    )
+    .addFields({
+      name: `${
+        app.emoji || '📋'
+      } ${app.name} Application`,
+      value:
+        'Are you sure you want to apply?\n\nOnce you start the application I will send you a series of questions. You will have **3 hours** to complete the application. If you do not complete the application in time, you will have to restart. If you wish to stop the application feel free to click the cancel button at any time.',
+    })
+    .setFooter(dmFooter());
+}
+
+function startedEmbed() {
+  return new EmbedBuilder()
+    .setColor(accent())
+    .setTitle(
+      'Application Started'
+    )
+    .setDescription(
+      'Please answer the questions below, either by clicking on the dropdown menus or sending a message to the bot with your response.'
+    )
+    .setFooter(dmFooter());
+}
+
+function questionEmbed(
+  app,
+  index
+) {
+  return new EmbedBuilder()
+    .setColor(accent())
+    .setTitle(
+      `${app.emoji || '📋'} ${app.name} Application`
+    )
+    .setDescription(
+      `**${index + 1}/${app.questions.length} Question:** ${app.questions[index]}\n\n-# To answer this question, please send a message to the bot with your response.`
+    )
+    .setFooter(dmFooter());
+}
+
+/* =========================================================
+   APPLICATION FLOW
+========================================================= */
+
+async function startApplication(i, app) {
+  if (
+    [...sessions.values()].some(
+      (s) =>
+        s.guildId === i.guildId &&
+        s.userId === i.user.id
+    )
+  ) {
+    return i.reply({
+      content:
+        'You already have an application in progress. Check your DMs.',
+      ephemeral: true,
+    });
+  }
+
+  const dm = await i.user
+    .createDM()
+    .catch(() => null);
+
+  if (!dm) {
+    return i.reply({
+      content:
+        'I could not DM you. Please enable DMs from server members and try again.',
+      ephemeral: true,
+    });
+  }
+
+  const s = {
+    guildId: i.guildId,
+    userId: i.user.id,
+    appId: app.id,
+    answers: [],
+    index: 0,
+    startedAt: null,
+    state: 'confirm',
+    dmChannelId: dm.id,
+    confirmMessageId: null,
+    currentQuestionMessageId: null,
+  };
+
+  sessions.set(
+    i.user.id,
+    s
+  );
+
+  await i.reply({
+    content:
+      `☁️ Check your DMs — your **${app.name}** application is ready to start.`,
+    ephemeral: true,
+  });
+
+  const sent = await dm.send({
+    embeds: [
+      confirmationEmbed(app),
+    ],
+    components:
+      confirmationRows(app.id),
+  });
+
+  s.confirmMessageId = sent.id;
+}
+
+async function beginApplication(
+  s,
+  dm,
+  interaction
+) {
+  const app = appType(s.appId);
+
+  if (!app) return;
+
+  s.state = 'active';
+  s.startedAt = Date.now();
+  s.index = 0;
+  s.answers = [];
+
+  if (interaction?.message) {
+    await interaction.message
+      .edit({
+        embeds: [
+          startedEmbed(),
+        ],
+        components: [
+          cancelRow(),
+          sourceRow(),
+        ],
+      })
+      .catch(() => {});
+  } else {
+    await dm.send({
+      embeds: [
+        startedEmbed(),
+      ],
+      components: [
+        cancelRow(),
+        sourceRow(),
+      ],
+    });
+  }
+
+  await askNext(s, dm);
+}
+
+async function askNext(s, dm) {
+  const app = appType(s.appId);
+
+  if (!app) return;
+
+  if (
+    s.index >= app.questions.length
+  ) {
+    return finish(s, dm);
+  }
+
+  const sent = await dm.send({
+    embeds: [
+      questionEmbed(
+        app,
+        s.index
+      ),
+    ],
+    components: [
+      cancelRow(),
+      sourceRow(),
+    ],
+  });
+
+  s.currentQuestionMessageId =
+    sent.id;
+}
+
+async function cancelApplication(
+  userId,
+  interaction
+) {
+  const s = sessions.get(userId);
+
+  if (!s) {
+    return interaction.reply({
+      content:
+        'There is no active Skye application to cancel.',
+      ephemeral: true,
+    });
+  }
+
+  sessions.delete(userId);
+
+  if (interaction.message) {
+    const embed =
+      EmbedBuilder.from(
+        interaction.message.embeds[0] ||
+          new EmbedBuilder()
+      )
+        .setColor(0x777F8E)
+        .setTitle(
+          'Application Cancelled'
+        )
+        .setDescription(
+          'Your Skye application has been cancelled. You can start a new application from the server panel.'
+        );
+
+    await interaction.message
+      .edit({
+        embeds: [embed],
+        components: [],
+      })
+      .catch(() => {});
+  }
+
+  return interaction.reply({
+    content:
+      'Application cancelled.',
+    ephemeral: true,
+  });
+}
+
+async function timedOut(s) {
+  if (
+    !s.startedAt ||
+    Date.now() - s.startedAt <
+      timeoutMs
+  ) {
+    return false;
+  }
+
+  sessions.delete(s.userId);
+
+  const user = await client.users
+    .fetch(s.userId)
+    .catch(() => null);
+
+  await user?.send({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x777F8E)
+        .setTitle(
+          'Application Timed Out'
+        )
+        .setDescription(
+          'Your Skye application was not completed within **3 hours**. You can start again from the application panel.'
+        )
+        .setFooter(dmFooter()),
+    ],
+  }).catch(() => {});
+
+  return true;
+}
+
+/* =========================================================
+   SUBMIT APPLICATION
+========================================================= */
+
+async function finish(s, dm) {
+  const app = appType(s.appId);
+
+  if (!app) {
+    sessions.delete(s.userId);
+    return;
+  }
+
+  const id = nextId();
+
+  const user = await client.users
+    .fetch(s.userId)
+    .catch(() => null);
+
+  const username =
+    user?.tag ||
+    user?.username ||
+    s.userId;
+
+  const record = {
+    id,
+    guildId: s.guildId,
+    userId: s.userId,
+    username,
+    type: app.name,
+    appId: app.id,
+    status: 'Pending',
+    submittedAt:
+      new Date().toISOString(),
+    questions: app.questions,
+    answers: s.answers,
+    reviewChannelId: '',
+    reviewMessageId: '',
+    reviewedBy: '',
+    reviewedByTag: '',
+    reviewedAt: '',
+    reviewReason: '',
+  };
+
+  addSubmission(record);
+
+  /*
+   * Add the application's onSubmit roles.
+   */
+  const guild = await client.guilds
+    .fetch(s.guildId)
+    .catch(() => null);
+
+  if (guild) {
+    await applyRoles(
+      guild,
+      s.userId,
+      app.roles?.onSubmit,
+      'add'
+    );
+  }
+
+  /*
+   * Send the completed application to the
+   * application's configured channel.
+   *
+   * Example:
+   * cfg.channels.support
+   * cfg.channels.creator
+   * cfg.channels.staff
+   * cfg.channels.partnership
+   */
+  const reviewChannelId =
+    channelFor(app.id);
+
+  let reviewChannel = null;
+
+  if (
+    reviewChannelId &&
+    client.isReady()
+  ) {
+    reviewChannel = await client.channels
+      .fetch(reviewChannelId)
+      .catch(() => null);
+  }
+
+  if (
+    reviewChannel?.isTextBased()
+  ) {
+    const chunks = [];
+
+    let current =
+      `**${id} · ${app.name} Application**\n` +
+      `Applicant: <@${s.userId}>\n\n`;
+
+    for (
+      let n = 0;
+      n < app.questions.length;
+      n++
+    ) {
+      const question =
+        app.questions[n];
+
+      const answer =
+        s.answers[n] || '—';
+
+      const line =
+        `**${n + 1}. ${question}**\n${answer}\n\n`;
+
+      /*
+       * Discord embed field values and descriptions
+       * have limits, so we split the application.
+       */
+      if (
+        current.length +
+          line.length >
+        3900
+      ) {
+        chunks.push(current);
+        current = '';
+      }
+
+      current += line;
+    }
+
+    if (current) {
+      chunks.push(current);
+    }
+
+    const embeds = [];
+
+    for (
+      let n = 0;
+      n < chunks.length;
+      n++
+    ) {
+      embeds.push(
+        new EmbedBuilder()
+          .setColor(accent())
+          .setTitle(
+            n === 0
+              ? `${app.emoji || '📋'} ${app.name} Application`
+              : `${app.emoji || '📋'} ${app.name} Application — Part ${n + 1}`
+          )
+          .setDescription(chunks[n])
+          .setFooter({
+            text:
+              n === 0
+                ? `Application ID: ${id}`
+                : `Application ID: ${id} · Part ${n + 1}`,
+          })
+      );
+    }
+
+    /*
+     * Discord allows up to 10 embeds per message.
+     * Send the first message with review buttons,
+     * then any additional chunks separately.
+     */
+    let firstMessage = null;
+
+    if (embeds.length) {
+      firstMessage =
+        await reviewChannel
+          .send({
+            embeds: [
+              embeds[0],
+            ],
+            components: [
+              reviewRows(id),
+            ],
+          })
+          .catch(() => null);
+    }
+
+    for (
+      let n = 1;
+      n < embeds.length;
+      n++
+    ) {
+      await reviewChannel
+        .send({
+          embeds: [embeds[n]],
+        })
+        .catch(() => {});
+    }
+
+    if (firstMessage) {
+      updateSubmission(id, {
+        reviewChannelId:
+          reviewChannel.id,
+        reviewMessageId:
+          firstMessage.id,
+      });
+    }
+  }
+
+  /*
+   * Tell the applicant their application was submitted.
+   */
+  const submittedMessage =
+    vars(
+      cfg.messages.submitted,
+      {
+        id,
+        type: app.name,
+      }
+    );
+
+  await dm.send({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(accent())
+        .setTitle(
+          'Application Submitted'
+        )
+        .setDescription(
+          submittedMessage
+        )
+        .setFooter(dmFooter()),
+    ],
+  }).catch(() => {});
+
+  sessions.delete(
+    s.userId
+  );
+}
+
+/* =========================================================
+   REVIEW MODAL
+========================================================= */
+
+function reasonModal(
+  id,
+  accepted
+) {
+  const input =
+    new TextInputBuilder()
+      .setCustomId('reason')
+      .setLabel(
+        'Reason / feedback'
+      )
+      .setStyle(
+        TextInputStyle.Paragraph
+      )
+      .setRequired(true)
+      .setMaxLength(1000)
+      .setPlaceholder(
+        accepted
+          ? 'Optional context for the applicant…'
+          : 'Explain why the application was denied…'
+      );
+
+  return new ModalBuilder()
+    .setCustomId(
+      `skye_reason_submit:${
+        accepted
+          ? 'accept'
+          : 'deny'
+      }:${id}`
+    )
+    .setTitle(
+      `${
+        accepted
+          ? 'Accept'
+          : 'Deny'
+      } Application with Reason`
+    )
+    .addComponents(
+      new ActionRowBuilder().addComponents(
+        input
+      )
+    );
+}
+
+/* =========================================================
+   REVIEW APPLICATION
+========================================================= */
+
+async function review(
+  i,
+  id,
+  status,
+  reason = ''
+) {
+  if (!permission(i)) {
+    return i.reply({
+      content:
+        'You do not have permission to review Skye applications.',
+      ephemeral: true,
+    });
+  }
+
+  const current =
+    allSubmissions().find(
+      (x) => x.id === id
+    );
+
+  if (!current) {
+    return i.reply({
+      content:
+        'Application record not found.',
+      ephemeral: true,
+    });
+  }
+
+  if (
+    current.status !== 'Pending'
+  ) {
+    return i.reply({
+      content:
+        `This application is already **${current.status}**.`,
+      ephemeral: true,
+    });
+  }
+
+  const patch = {
+    status,
+    reviewedBy:
+      i.user.id,
+    reviewedByTag:
+      i.user.tag,
+    reviewedAt:
+      new Date().toISOString(),
+    reviewReason:
+      reason,
+  };
+
+  updateSubmission(
+    id,
+    patch
+  );
+
+  const app =
+    appType(current.appId);
+
+  const guild =
+    await client.guilds
+      .fetch(current.guildId)
+      .catch(() => null);
+
+  if (guild && app) {
+    if (status === 'Accepted') {
+      await applyRoles(
+        guild,
+        current.userId,
+        app.roles?.onAccept,
+        'add'
+      );
+
+      await applyRoles(
+        guild,
+        current.userId,
+        app.roles?.removeOnAccept,
+        'remove'
+      );
+    } else if (
+      status === 'Denied'
+    ) {
+      await applyRoles(
+        guild,
+        current.userId,
+        app.roles?.onDeny,
+        'add'
+      );
+
+      await applyRoles(
+        guild,
+        current.userId,
+        app.roles?.removeOnDeny,
+        'remove'
+      );
+    }
+  }
+
+  const user =
+    await client.users
+      .fetch(current.userId)
+      .catch(() => null);
+
+  const msg =
+    status === 'Accepted'
+      ? cfg.messages.accepted
+      : cfg.messages.denied;
+
+  await user?.send(
+    vars(msg, {
+      id,
+      reason,
+      type:
+        current.type,
+    })
+  ).catch(() => {});
+
+  const targetMessage =
+    i.message ||
+    await (async () => {
+      if (
+        !current.reviewChannelId ||
+        !current.reviewMessageId
+      ) {
+        return null;
+      }
+
+      const channel =
+        await guild?.channels
+          .fetch(
+            current.reviewChannelId
+          )
+          .catch(() => null);
+
+      return channel?.messages
+        ?.fetch(
+          current.reviewMessageId
+        )
+        .catch(() => null);
+    })();
+
+  if (targetMessage) {
+    const old =
+      targetMessage.embeds[0];
+
+    const color =
+      status === 'Accepted'
+        ? 0x57C98B
+        : 0xE06472;
+
+    const existingFields =
+      old?.fields || [];
+
+    const embed =
+      EmbedBuilder.from(old)
+        .setColor(color)
+        .setFields(
+          ...existingFields.filter(
+            (f) =>
+              f.name !== 'Status' &&
+              f.name !== 'Review'
+          ),
+          {
+            name: 'Status',
+            value:
+              status === 'Accepted'
+                ? '🟢 Accepted'
+                : '🔴 Denied',
+            inline: true,
+          },
+          {
+            name: 'Review',
+            value:
+              `<@${i.user.id}>${
+                reason
+                  ? `\n${reason}`
+                  : ''
+              }`,
+            inline: false,
+          }
+        )
+        .setFooter({
+          text:
+            `Reviewed by ${i.user.tag}`,
+        });
+
+    await targetMessage
+      .edit({
+        embeds: [embed],
+        components: [
+          reviewRows(id, true),
+        ],
+      })
+      .catch(() => {});
+  }
+
+  return i.reply({
+    content:
+      `${
+        status === 'Accepted'
+          ? '✅ Accepted'
+          : '⛔ Denied'
+      } **${id}**.`,
+    ephemeral: true,
+  });
+}
+
+/* =========================================================
+   DISCORD READY
+========================================================= */
+
+client.once(
+  'ready',
+  () => {
+    console.log(
+      `Skye Applications online as ${client.user.tag}`
+    );
+  }
+);
+
+/* =========================================================
+   DM APPLICATION ANSWERS
+========================================================= */
+
+client.on(
+  'messageCreate',
+  async (m) => {
+    if (
+      m.author.bot ||
+      m.guild
+    ) {
+      return;
+    }
+
+    const s =
+      sessions.get(
+        m.author.id
+      );
+
+    if (
+      !s ||
+      s.state !== 'active'
+    ) {
+      return;
+    }
+
+    if (
+      await timedOut(s)
+    ) {
+      return;
+    }
+
+    const content =
+      m.content.trim();
+
+    if (!content) {
+      return;
+    }
+
+    /*
+     * Keep the old cancel behavior too.
+     */
+    if (
+      content.toLowerCase() ===
+      'cancel'
+    ) {
+      sessions.delete(
+        m.author.id
+      );
+
+      await m.channel
+        .send({
+          embeds: [
+            new EmbedBuilder()
+              .setColor(0x777F8E)
+              .setTitle(
+                'Application Cancelled'
+              )
+              .setDescription(
+                'Your Skye application has been cancelled. You can start a new application from the server panel.'
+              )
+              .setFooter(
+                dmFooter()
+              ),
+          ],
+        })
+        .catch(() => {});
+
+      return;
+    }
+
+    s.answers.push(
+      content
+    );
+
+    s.index++;
+
+    await askNext(
+      s,
+      m.channel
+    );
+  }
+);
+
+/* =========================================================
+   INTERACTIONS
+========================================================= */
+
+client.on(
+  'interactionCreate',
+  async (i) => {
+    try {
+      /* ================================================
+         SLASH COMMANDS
+      ================================================ */
+
+      if (
+        i.isChatInputCommand()
+      ) {
+        if (
+          !i.memberPermissions?.has(
+            PermissionsBitField.Flags.ManageGuild
+          )
+        ) {
+          return i.reply({
+            content:
+              'You need Manage Server to use Skye admin commands.',
+            ephemeral: true,
+          });
+        }
+
+        /* /skye-panel */
+
+        if (
+          i.commandName ===
+          'skye-panel'
+        ) {
+          await i.channel.send({
+            embeds: [
+              panelEmbed(),
+            ],
+            components:
+              panelComponents(),
+          });
+
+          return i.reply({
+            content:
+              '☁️ Skye application panel posted.',
+            ephemeral: true,
+          });
+        }
+
+        /* /skye-config */
+
+        if (
+          i.commandName ===
+          'skye-config'
+        ) {
+          const o =
+            i.options;
+
+          for (
+            const k of [
+              'support',
+              'creator',
+              'staff',
+              'partnership',
+            ]
+          ) {
+            const channel =
+              o.getChannel(
+                `${k}_channel`
+              );
+
+            if (channel) {
+              cfg.channels[k] =
+                channel.id;
+            }
+          }
+
+          const role =
+            o.getRole(
+              'review_role'
+            );
+
+          if (role) {
+            cfg.reviewRoleId =
+              role.id;
+          }
+
+          save(cfg);
+
+          return i.reply({
+            ephemeral: true,
+            content:
+              `**Skye configuration saved.**\n` +
+              `🛠️ ${
+                cfg.channels.support
+                  ? `<#${cfg.channels.support}>`
+                  : '—'
+              } · ` +
+              `🎥 ${
+                cfg.channels.creator
+                  ? `<#${cfg.channels.creator}>`
+                  : '—'
+              } · ` +
+              `🛡️ ${
+                cfg.channels.staff
+                  ? `<#${cfg.channels.staff}>`
+                  : '—'
+              } · ` +
+              `🤝 ${
+                cfg.channels.partnership
+                  ? `<#${cfg.channels.partnership}>`
+                  : '—'
+              }\n` +
+              `👮 Review role: ${
+                cfg.reviewRoleId
+                  ? `<@&${cfg.reviewRoleId}>`
+                  : '—'
+              }`,
+          });
+        }
+
+        /* /skye-stats */
+
+        if (
+          i.commandName ===
+          'skye-stats'
+        ) {
+          const all =
+            allSubmissions();
+
+          const pending =
+            all.filter(
+              (x) =>
+                x.status ===
+                'Pending'
+            ).length;
+
+          const accepted =
+            all.filter(
+              (x) =>
+                x.status ===
+                'Accepted'
+            ).length;
+
+          const denied =
+            all.filter(
+              (x) =>
+                x.status ===
+                'Denied'
+            ).length;
+
+          const changes =
+            all.filter(
+              (x) =>
+                x.status ===
+                'Changes Requested'
+            ).length;
+
+          return i.reply({
+            ephemeral: true,
+            embeds: [
+              new EmbedBuilder()
+                .setColor(
+                  accent()
+                )
+                .setTitle(
+                  '☁️ Skye Application Statistics'
+                )
+                .addFields(
+                  {
+                    name: 'Total',
+                    value:
+                      String(
+                        all.length
+                      ),
+                    inline: true,
+                  },
+                  {
+                    name: 'Pending',
+                    value:
+                      String(
+                        pending
+                      ),
+                    inline: true,
+                  },
+                  {
+                    name: 'Accepted',
+                    value:
+                      String(
+                        accepted
+                      ),
+                    inline: true,
+                  },
+                  {
+                    name: 'Denied',
+                    value:
+                      String(
+                        denied
+                      ),
+                    inline: true,
+                  },
+                  {
+                    name:
+                      'Changes Requested',
+                    value:
+                      String(
+                        changes
+                      ),
+                    inline: true,
+                  }
+                ),
+            ],
+          });
+        }
+
+        /* /skye-search */
+
+        if (
+          i.commandName ===
+          'skye-search'
+        ) {
+          const q =
+            i.options
+              .getString(
+                'query'
+              )
+              .toLowerCase();
+
+          const status =
+            i.options.getString(
+              'status'
+            );
+
+          const hits =
+            allSubmissions()
+              .filter(
+                (x) =>
+                  (!status ||
+                    x.status ===
+                      status) &&
+                  [
+                    x.id,
+                    x.username,
+                    x.userId,
+                    x.type,
+                    x.appId,
+                  ].some(
+                    (v) =>
+                      String(v)
+                        .toLowerCase()
+                        .includes(q)
+                  )
+              )
+              .slice(-10)
+              .reverse();
+
+          return i.reply({
+            ephemeral: true,
+            content: hits.length
+              ? hits
+                  .map(
+                    (x) =>
+                      `• \`${x.id}\` — **${x.username}** — ${x.type} — ${x.status}`
+                  )
+                  .join('\n')
+              : 'No applications found.',
+          });
+        }
+
+        /* /skye-trust */
+
+        if (
+          i.commandName ===
+          'skye-trust'
+        ) {
+          const u =
+            i.options.getUser(
+              'user'
+            );
+
+          cfg.trustedUserIds = [
+            ...new Set([
+              ...(cfg.trustedUserIds ||
+                []),
+              u.id,
+            ]),
+          ];
+
+          save(cfg);
+
+          return i.reply({
+            ephemeral: true,
+            content:
+              `🔐 <@${u.id}> is now a trusted Skye dashboard user.`,
+          });
+        }
+
+        /* /skye-untrust */
+
+        if (
+          i.commandName ===
+          'skye-untrust'
+        ) {
+          const u =
+            i.options.getUser(
+              'user'
+            );
+
+          if (
+            u.id === i.user.id
+          ) {
+            return i.reply({
+              ephemeral: true,
+              content:
+                'You cannot remove your own dashboard access here.',
+            });
+          }
+
+          cfg.trustedUserIds =
+            (
+              cfg.trustedUserIds ||
+              []
+            ).filter(
+              (id) =>
+                id !== u.id
+            );
+
+          save(cfg);
+
+          return i.reply({
+            ephemeral: true,
+            content:
+              `🔓 <@${u.id}> was removed from the trusted dashboard users.`,
+          });
+        }
+
+        /* /skye-applicant */
+
+        if (
+          i.commandName ===
+          'skye-applicant'
+        ) {
+          const u =
+            i.options.getUser(
+              'user'
+            );
+
+          const hits =
+            allSubmissions()
+              .filter(
+                (x) =>
+                  x.userId ===
+                  u.id
+              )
+              .slice(-10)
+              .reverse();
+
+          return i.reply({
+            ephemeral: true,
+            content: hits.length
+              ? hits
+                  .map(
+                    (x) =>
+                      `• \`${x.id}\` — ${x.type} — ${x.status}`
+                  )
+                  .join('\n')
+              : `No applications found for ${u.tag}.`,
+          });
+        }
+
+        /* /skye-help */
+
+        if (
+          i.commandName ===
+          'skye-help'
+        ) {
+          return i.reply({
+            ephemeral: true,
+            content:
+              '**Skye Applications**\n' +
+              '`/skye-panel` post panel\n' +
+              '`/skye-config` configure channels/review role\n' +
+              '`/skye-stats` view totals\n' +
+              '`/skye-search` search applications\n' +
+              '`/skye-applicant` view a user’s applications',
+          });
+        }
+      }
+
+      /* ================================================
+         CANCEL APPLICATION
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId ===
+          'skye_cancel_application'
+      ) {
+        return cancelApplication(
+          i.user.id,
+          i
+        );
+      }
+
+      /* ================================================
+         START APPLICATION FROM DM
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId.startsWith(
+          'skye_dm_start:'
+        )
+      ) {
+        const s =
+          sessions.get(
+            i.user.id
+          );
+
+        const app =
+          appType(
+            i.customId.split(
+              ':'
+            )[1]
+          );
+
+        if (
+          !s ||
+          !app ||
+          s.appId !==
+            app.id
+        ) {
+          return i.reply({
+            content:
+              'This application session is no longer active. Please start again from the server panel.',
+            ephemeral: true,
+          });
+        }
+
+        await beginApplication(
+          s,
+          i.channel,
+          i
+        );
+
+        return i.deferUpdate();
+      }
+
+      /* ================================================
+         DISABLED SOURCE BUTTON
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId ===
+          'skye_dm_source'
+      ) {
+        return i.deferUpdate();
+      }
+
+      /* ================================================
+         APPLICATION PANEL BUTTON
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId.startsWith(
+          'skye_apply:'
+        )
+      ) {
+        const app =
+          appType(
+            i.customId.split(
+              ':'
+            )[1]
+          );
+
+        if (app) {
+          return startApplication(
+            i,
+            app
+          );
+        }
+      }
+
+      /* ================================================
+         ACCEPT WITH REASON
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId.startsWith(
+          'skye_accept_reason:'
+        )
+      ) {
+        if (!permission(i)) {
+          return i.reply({
+            content:
+              'You do not have permission to review applications.',
+            ephemeral: true,
+          });
+        }
+
+        return i.showModal(
+          reasonModal(
+            i.customId.split(
+              ':'
+            )[1],
+            true
+          )
+        );
+      }
+
+      /* ================================================
+         DENY WITH REASON
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId.startsWith(
+          'skye_deny_reason:'
+        )
+      ) {
+        if (!permission(i)) {
+          return i.reply({
+            content:
+              'You do not have permission to review applications.',
+            ephemeral: true,
+          });
+        }
+
+        return i.showModal(
+          reasonModal(
+            i.customId.split(
+              ':'
+            )[1],
+            false
+          )
+        );
+      }
+
+      /* ================================================
+         ACCEPT
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId.startsWith(
+          'skye_accept:'
+        )
+      ) {
+        return review(
+          i,
+          i.customId.split(
+            ':'
+          )[1],
+          'Accepted'
+        );
+      }
+
+      /* ================================================
+         DENY
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId.startsWith(
+          'skye_deny:'
+        )
+      ) {
+        return review(
+          i,
+          i.customId.split(
+            ':'
+          )[1],
+          'Denied'
+        );
+      }
+
+      /* ================================================
+         DETAILS
+      ================================================ */
+
+      if (
+        i.isButton() &&
+        i.customId.startsWith(
+          'skye_details:'
+        )
+      ) {
+        const id =
+          i.customId.split(
+            ':'
+          )[1];
+
+        const record =
+          allSubmissions().find(
+            (x) =>
+              x.id === id
+          );
+
+        if (!record) {
+          return i.reply({
+            content:
+              'Application not found.',
+            ephemeral: true,
+          });
+        }
+
+        const chunks = [];
+
+        let current =
+          `**${record.id} · ${record.type} · ${record.status}**\n` +
+          `Applicant: <@${record.userId}>\n\n`;
+
+        record.questions.forEach(
+          (question, n) => {
+            const line =
+              `**${n + 1}. ${question}**\n` +
+              `${record.answers[n] || '—'}\n\n`;
+
+            if (
+              current.length +
+                line.length >
+              1800
+            ) {
+              chunks.push(
+                current
+              );
+
+              current = '';
+            }
+
+            current += line;
+          }
+        );
+
+        if (current) {
+          chunks.push(
+            current
+          );
+        }
+
+        await i.reply({
+          ephemeral: true,
+          content:
+            chunks.shift() ||
+            'No application details found.',
+        });
+
+        for (
+          const chunk of chunks
+        ) {
+          await i.followUp({
+            ephemeral: true,
+            content: chunk,
+          });
+        }
+
+        return;
+      }
+
+      /* ================================================
+         REASON MODAL
+      ================================================ */
+
+      if (
+        i.isModalSubmit() &&
+        i.customId.startsWith(
+          'skye_reason_submit:'
+        )
+      ) {
+        const [
+          ,
+          kind,
+          id,
+        ] =
+          i.customId.split(
+            ':'
+          );
+
+        const reason =
+          i.fields.getTextInputValue(
+            'reason'
+          );
+
+        return review(
+          i,
+          id,
+          kind === 'accept'
+            ? 'Accepted'
+            : 'Denied',
+          reason
+        );
+      }
+    } catch (e) {
+      console.error(
+        'Skye interaction error:',
+        e
+      );
+
+      if (
+        !i.replied &&
+        !i.deferred
+      ) {
+        await i
+          .reply({
+            content:
+              'Skye encountered an error while processing that action.',
+            ephemeral: true,
+          })
+          .catch(() => {});
+      }
+    }
+  }
+);
+
+/* =========================================================
+   APPLICATION TIMEOUT CHECK
 ========================================================= */
 
 setInterval(() => {
-  const now = Date.now();
-
-  for (const [
-    userId,
-    session,
-  ] of applicationSessions) {
-    if (session.expires < now) {
-      applicationSessions.delete(userId);
-    }
+  for (
+    const s of sessions.values()
+  ) {
+    timedOut(s).catch(() => {});
   }
-
-  for (const [
-    sessionId,
-    session,
-  ] of dashboardSessions) {
-    if (session.expires < now) {
-      dashboardSessions.delete(sessionId);
-    }
-  }
-}, 60 * 1000);
+}, 60_000);
 
 /* =========================================================
-   LOGIN
+   START DISCORD BOT
 ========================================================= */
 
 if (!process.env.DISCORD_TOKEN) {
@@ -1773,11 +2822,13 @@ if (!process.env.DISCORD_TOKEN) {
   );
 } else {
   client
-    .login(process.env.DISCORD_TOKEN)
-    .catch((error) => {
+    .login(
+      process.env.DISCORD_TOKEN
+    )
+    .catch((err) => {
       console.error(
         'Discord login failed:',
-        error
+        err
       );
     });
 }
